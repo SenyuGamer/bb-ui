@@ -26,6 +26,7 @@ RP las lee con `q.property(...)`.
     "fov": 70,                        // camera.setFov
     "distance": 2.5,                  // bloques entre la cámara y la entidad
     "height": 0,                      // desplazamiento vertical de la entidad respecto a los ojos
+    "xray": true,                     // true (def.): se dibuja encima de bloques/entidades (material sin depth test); false: los bloques la tapan
     "anchor": "player",               // "player" (delante del jugador) | "trigger" (sobre el bloque/entidad que la abrió, si hay)
     "sounds": { "move": "random.click", "accept": "random.orb", "open": "random.pop", "close": "random.pop" } // opcional
   },

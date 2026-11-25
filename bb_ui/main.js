@@ -379,6 +379,21 @@ function buildDigitsGeo(ID, numbers, boneMap) {
 }
 const round = (v) => Math.round(v * 1000) / 1000;
 
+// Custom entity materials, merged into RP/materials/entity.material.
+// bb_ui.xray: drawn over blocks and entities (no depth test), like a screen overlay.
+// bb_ui.flat: normal depth test (blocks can hide the UI).
+function writeEntityMaterials() {
+  const file = path.join(T_RP, 'materials/entity.material');
+  const doc = readJsonIfExists(file) || { materials: { version: '1.0.0' } };
+  doc.materials = doc.materials || { version: '1.0.0' };
+  doc.materials['bb_ui.xray:entity_alphatest'] = {
+    '-defines': ['FANCY'],
+    '+states': ['DisableDepthTest', 'DisableDepthWrite'],
+  };
+  doc.materials['bb_ui.flat:entity_alphatest'] = { '-defines': ['FANCY'] };
+  writeJson(file, doc);
+}
+
 async function generateUi(uiId, ui, geo, ctx) {
   const { NS, maxButtons } = ctx;
   const ID = uiId;
@@ -517,6 +532,21 @@ async function generateUi(uiId, ui, geo, ctx) {
   // ---- RP geometry / textures
   const geoOut = JSON.parse(JSON.stringify(geo));
   geoOut['minecraft:geometry'][0].description.identifier = `geometry.bb_ui.${ID}`;
+  const xray = ui.display?.xray !== false;
+  if (xray) {
+    // Without depth test the draw order decides what is on top: draw back to front.
+    // The UI faces -Z toward the viewer, so a larger z is further back.
+    const depth = (b) => {
+      const cs = b.cubes || [];
+      if (!cs.length) return b.pivot ? b.pivot[2] : 0;
+      return cs.reduce((s, c) => s + c.origin[2] + (c.size?.[2] || 0) / 2, 0) / cs.length;
+    };
+    const bones = geoOut['minecraft:geometry'][0].bones;
+    bones.forEach((b, i) => { b.__i = i; });
+    bones.sort((a, b) => depth(b) - depth(a) || a.__i - b.__i);
+    bones.forEach((b) => { delete b.__i; });
+  }
+  writeEntityMaterials();
   writeJson(path.join(T_RP, `models/entity/bb_ui/${ID}.geo.json`), geoOut);
   mkdirp(path.join(T_RP, 'textures/bb_ui'));
   fs.copyFileSync(path.join(DATA_DIR, ID, 'texture.png'), path.join(T_RP, `textures/bb_ui/${ID}.png`));
@@ -587,7 +617,7 @@ async function generateUi(uiId, ui, geo, ctx) {
   // ---- client entity
   const desc = {
     identifier: entityId,
-    materials: { default: 'entity_alphatest' },
+    materials: { default: xray ? 'bb_ui.xray' : 'bb_ui.flat' },
     textures: { default: `textures/bb_ui/${ID}` },
     geometry: { default: `geometry.bb_ui.${ID}` },
     render_controllers: [`controller.render.bb_ui.${ID}`],
