@@ -1,0 +1,8 @@
+{
+  "filters": [
+    {
+      "runWith": "nodejs",
+      "script": "./main.js"
+    }
+  ]
+}

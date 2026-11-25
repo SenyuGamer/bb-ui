@@ -1,0 +1,28 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "BB UI Example BP",
+    "description": "Example behavior pack for the bb_ui Regolith filter",
+    "uuid": "6f1b2a3e-8c4d-4e7a-9b15-2d0c7e4a91f3",
+    "version": [1, 0, 0],
+    "min_engine_version": [1, 21, 90]
+  },
+  "modules": [
+    {
+      "type": "data",
+      "uuid": "b3e94d1a-5f27-4c8b-a6d0-91e8c2f7a504",
+      "version": [1, 0, 0]
+    },
+    {
+      "type": "script",
+      "language": "javascript",
+      "uuid": "d7a05c62-1e93-4b48-8f3a-c4b6e9d20817",
+      "version": [1, 0, 0],
+      "entry": "scripts/main.js"
+    }
+  ],
+  "dependencies": [
+    { "module_name": "@minecraft/server", "version": "2.9.0" },
+    { "uuid": "e2c8f4b7-3a61-4d95-b0e2-7f5a1c96d3a8", "version": [1, 0, 0] }
+  ]
+}

@@ -1,0 +1,5 @@
+dist/
+.regolith/
+node_modules/
+examples/dist
+*.ini

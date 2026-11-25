@@ -1,0 +1,17 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "BB UI Example RP",
+    "description": "Example resource pack for the bb_ui Regolith filter",
+    "uuid": "e2c8f4b7-3a61-4d95-b0e2-7f5a1c96d3a8",
+    "version": [1, 0, 0],
+    "min_engine_version": [1, 21, 90]
+  },
+  "modules": [
+    {
+      "type": "resources",
+      "uuid": "a91c3e58-7d24-4f06-8b7e-5c0d2f6e1b39",
+      "version": [1, 0, 0]
+    }
+  ]
+}

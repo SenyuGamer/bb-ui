@@ -1,0 +1,39 @@
+{
+	"$schema": "https://raw.githubusercontent.com/Bedrock-OSS/regolith-schemas/main/config/v1.6.json",
+	"author": "SenyuGamer",
+	"name": "bb-ui-example",
+	"packs": {
+		"behaviorPack": "./packs/BP",
+		"resourcePack": "./packs/RP"
+	},
+	"regolith": {
+		"dataPath": "./packs/data",
+		"filterDefinitions": {
+			"bb_ui": { "runWith": "nodejs", "script": "../bb_ui/main.js" }
+		},
+		"formatVersion": "1.6.0",
+		"profiles": {
+			"default": {
+				"export": {
+					"build": "standard",
+					"readOnly": false,
+					"target": "development"
+				},
+				"filters": [
+					{ "filter": "bb_ui" }
+				]
+			},
+			"build": {
+				"export": {
+					"target": "exact",
+					"rpPath": "./dist/RP",
+					"bpPath": "./dist/BP",
+					"readOnly": false
+				},
+				"filters": [
+					{ "filter": "bb_ui" }
+				]
+			}
+		}
+	}
+}

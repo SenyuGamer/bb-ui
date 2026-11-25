@@ -1,0 +1,58 @@
+{
+  "format_version": 1,
+  "id": "example",
+  "namespace": "bbui_example",
+  "display": {
+    "fov": 70,
+    "distance": 2.5,
+    "height": 0,
+    "anchor": "player",
+    "sounds": { "move": "random.click", "accept": "random.orb", "open": "random.pop", "close": "random.pop" }
+  },
+  "open": [
+    { "type": "item", "item": "bbui_example:ui_example", "generate": { "name": "UI Example", "texture": "textures/items/book_normal" } },
+    { "type": "command", "name": "bbui_example:example_ui", "permission": "any" }
+  ],
+  "start_screen": "main",
+  "screens": [
+    {
+      "id": "main",
+      "default_focus": "btn_shop",
+      "actionbar": "Coins: {coins}",
+      "elements": [
+        { "bone": "btn_shop", "type": "button", "highlight": "btn_shop_hl",
+          "nav": { "up": null, "down": "btn_fn", "left": null, "right": "btn_cmd" },
+          "action": { "type": "goto", "screen": "shop" } },
+        { "bone": "btn_cmd", "type": "button", "highlight": "btn_cmd_hl",
+          "action": { "type": "command", "command": "say hi {player}", "as": "player" } },
+        { "bone": "btn_fn", "type": "button", "highlight": "btn_fn_hl",
+          "action": { "type": "script", "fn": "exampleHello", "args": { "greeting": "hello" } } },
+        { "bone": "btn_close", "type": "button", "highlight": "btn_close_hl",
+          "action": { "type": "close" } },
+        { "bone": "logo", "type": "image" },
+        { "bone": "coins_num", "type": "number", "query": "coins", "digits": 4, "align": "right" }
+      ]
+    },
+    {
+      "id": "shop",
+      "bones": ["shop_bg"],
+      "default_focus": "btn_add",
+      "actionbar": "Coins: {coins}",
+      "elements": [
+        { "bone": "btn_add", "type": "button", "highlight": "btn_add_hl",
+          "action": { "type": "add", "key": "bbui_example:coins", "amount": 5, "min": 0, "max": 9999 } },
+        { "bone": "btn_buy", "type": "button", "highlight": "btn_buy_hl",
+          "visible_if": { "query": "coins", "op": ">=", "value": 10 },
+          "action": { "type": "sequence", "actions": [
+            { "type": "add", "key": "bbui_example:coins", "amount": -10, "min": 0 },
+            { "type": "command", "command": "give {player} apple 1" }
+          ] } },
+        { "bone": "btn_back", "type": "button", "highlight": "btn_back_hl",
+          "action": { "type": "back" } }
+      ]
+    }
+  ],
+  "queries": {
+    "coins": { "source": "dynamic_property", "key": "bbui_example:coins", "default": 0 }
+  }
+}
