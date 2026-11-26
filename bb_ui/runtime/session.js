@@ -1,8 +1,8 @@
 // BB UI sessions: one per player, one display entity per session.
-import { world, system, InputPermissionCategory, HudElement, HudVisibility } from "@minecraft/server";
+import { world, system, InputPermissionCategory, InputMode, HudElement, HudVisibility } from "@minecraft/server";
 import { UI_REGISTRY } from "./generated/ui_registry.js";
 import { getQueryNumber, evalCondition, substituteQueries } from "./queries.js";
-import { nextFocus, visibleButtons } from "./nav.js";
+import { nextFocus, visibleButtons, MODEL_RIGHT_SIGN } from "./nav.js";
 import { runAction } from "./actions.js";
 
 // getMovementVector(): x > 0 is a strafe to the LEFT (A key). Flip this constant if it turns out mirrored in game.
@@ -14,6 +14,18 @@ const INPUT_GRACE_TICKS = 5; // ignore Jump/Sneak right after opening (the openi
 const CAMERA_EASE_SECONDS = 0.3;
 const CAMERA_FORWARD = 0.6; // blocks in front of the eyes, out of the player's head
 const BACKDROP_MARGIN = 0.08; // the backdrop quad sits this far in front of the camera
+// Mouse cursor (keyboard + mouse): turning the view this many degrees moves the cursor across the whole UI width
+// (times display.cursor.sensitivity). The player's pitch is pulled back to 0 past CURSOR_PITCH_LIMIT.
+const CURSOR_DEG_SPAN = 120;
+const CURSOR_PITCH_LIMIT = 45;
+// After the pitch is pulled back, the client may still report the old rotation for a few ticks: ignore deltas meanwhile,
+// and treat any single-tick turn larger than this as a resync, not as mouse movement.
+const CURSOR_RESYNC_TICKS = 4;
+const CURSOR_MAX_STEP_DEG = 35;
+// per-player multiplier of the cursor speed (settings form)
+export const CURSOR_SENS_KEY = "bb_ui:cursor_sens";
+export const CURSOR_SENS_MIN = 0.2;
+export const CURSOR_SENS_MAX = 3;
 
 export const SCALE_KEY = "bb_ui:scale";
 const CALIB_MIN = 0.5;
@@ -86,6 +98,10 @@ function applyEarlyProps(session) {
     setProp(session, "focus", session.focus);
     if (def.display?.calibrate !== false) setProp(session, "calib", session.calib);
     if (def.display?.backdrop !== false) setProp(session, "bd", session.bd);
+    if (def.cursor) {
+        if (session.mouse) pushCursor(session);
+        else setProp(session, "cur", false);
+    }
     for (const n of m.numbers) setProp(session, `n${n.k}`, getQueryNumber(player, def, n.query));
     for (const c of m.conds) setProp(session, `v${c.k}`, evalCondition(player, def, c.cond));
 }
@@ -173,6 +189,10 @@ export function gotoScreen(session, screenId, push = true) {
     setProp(session, "focus", session.focus);
     clearPress(session);
     refreshSession(session);
+    if (session.mouse) {
+        session.hover = hoverIndex(session);
+        if (session.hover >= 0) setFocus(session, session.hover, false);
+    }
     return true;
 }
 
@@ -470,6 +490,10 @@ function finishCalibration(session, scale) {
     session.calib = false;
     session.openedTick = tickCount; // the Jump/Sneak that ended calibration must not also act on the UI
     setProp(session, "calib", false);
+    if (session.mouse) {
+        session.cursorHidden = false;
+        pushCursor(session);
+    }
     play(session, "accept");
     updateActionbar(session);
     refreshSession(session);
@@ -483,6 +507,136 @@ function calibrationTick(session) {
     session.lastMoveTick = tickCount;
     const next = round2(clamp(session.scale + (dir === "up" ? CALIB_STEP : -CALIB_STEP), CALIB_MIN, CALIB_MAX));
     if (next !== session.scale) applyScale(session, next);
+}
+
+// ---------- mouse cursor ----------
+export function readCursorSens(player) {
+    const v = Number(player.getDynamicProperty(CURSOR_SENS_KEY));
+    return Number.isFinite(v) && v > 0 ? clamp(v, CURSOR_SENS_MIN, CURSOR_SENS_MAX) : 1;
+}
+
+/** After the settings form: new sensitivity, and optionally re-enter calibration in place. */
+export function applySettings(session, { recalibrate = false } = {}) {
+    if (!session.active) return;
+    session.sens = readCursorSens(session.player);
+    session.prevRot = undefined;
+    session.cursorSkipUntil = tickCount + CURSOR_RESYNC_TICKS;
+    if (recalibrate && calibrationEnabled(session.def)) {
+        session.calib = true;
+        session.openedTick = tickCount; // the click that closed the form must not end calibration
+        setProp(session, "calib", true);
+        if (session.def.cursor) setProp(session, "cur", false);
+        updateActionbar(session);
+    }
+}
+
+function mouseWanted(session) {
+    if (!session.def.cursor) return false;
+    try {
+        return session.player.inputInfo.lastInputModeUsed === InputMode.KeyboardAndMouse;
+    } catch {
+        return false;
+    }
+}
+
+function pushCursor(session) {
+    setProp(session, "cx", Math.round(session.cx * 100) / 100);
+    setProp(session, "cy", Math.round(session.cy * 100) / 100);
+    setProp(session, "cur", !session.cursorHidden);
+}
+
+/** Puts the cursor on the centre of the focused button (or of the UI). */
+function cursorToFocus(session) {
+    const { def } = session;
+    const bone = (def.buttons?.[session.screenId] ?? [])[session.focus];
+    const r = bone && def.cursor.rects?.[bone];
+    const b = def.cursor.bounds;
+    session.cx = r ? (r[0] + r[2]) / 2 : (b[0] + b[2]) / 2;
+    session.cy = r ? (r[1] + r[3]) / 2 : (b[1] + b[3]) / 2;
+}
+
+function enterMouse(session) {
+    session.mouse = true;
+    session.cursorHidden = false;
+    // the view stays on the UI camera; with Camera input on, the mouse turns the player and that drives the cursor
+    try { session.player.inputPermissions.setPermissionCategory(InputPermissionCategory.Camera, true); } catch {}
+    session.prevRot = session.player.getRotation();
+    session.sens = readCursorSens(session.player);
+    cursorToFocus(session);
+    session.hover = hoverIndex(session);
+    pushCursor(session);
+}
+
+function leaveMouse(session) {
+    session.mouse = false;
+    session.hover = -1;
+    try { session.player.inputPermissions.setPermissionCategory(InputPermissionCategory.Camera, false); } catch {}
+    setProp(session, "cur", false);
+}
+
+/** Index (into def.buttons[screen]) of the visible button under the cursor, or -1. Hit areas include a margin, so they can
+ * overlap: the button whose centre is nearest (relative to its size) wins. */
+function hoverIndex(session) {
+    const { def } = session;
+    if (!def.cursor) return -1;
+    const bones = def.buttons?.[session.screenId] ?? [];
+    let best = -1;
+    let bestArea = Infinity;
+    for (const i of visibleButtons(session)) {
+        const r = def.cursor.rects?.[bones[i]];
+        if (!r) continue;
+        if (session.cx < r[0] || session.cx > r[2] || session.cy < r[1] || session.cy > r[3]) continue;
+        const dx = (session.cx - (r[0] + r[2]) / 2) / (r[2] - r[0] || 1);
+        const dy = (session.cy - (r[1] + r[3]) / 2) / (r[3] - r[1] || 1);
+        const d = dx * dx + dy * dy;
+        if (d < bestArea) {
+            bestArea = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
+function cursorTick(session) {
+    const { player, def } = session;
+    if (session.formOpen) return;
+    const rot = player.getRotation();
+    const prev = session.prevRot ?? rot;
+    session.prevRot = rot;
+    if (tickCount < (session.cursorSkipUntil ?? 0)) return; // waiting for the client to catch up with a recentre
+    const dYaw = ((((rot.y - prev.y) % 360) + 540) % 360) - 180;
+    const dPitch = rot.x - prev.x;
+    if (Math.abs(rot.x) > CURSOR_PITCH_LIMIT) {
+        // keep the pitch away from +-90, where the mouse stops turning the player
+        try {
+            player.teleport(player.location, { keepVelocity: false, rotation: { x: 0, y: rot.y } });
+            session.prevRot = undefined;
+            session.cursorSkipUntil = tickCount + CURSOR_RESYNC_TICKS;
+        } catch {}
+    }
+    if (Math.abs(dYaw) < 1e-3 && Math.abs(dPitch) < 1e-3) return;
+    if (Math.abs(dYaw) > CURSOR_MAX_STEP_DEG || Math.abs(dPitch) > CURSOR_MAX_STEP_DEG) return; // a resync, not the mouse
+    session.cursorHidden = false; // the mouse moved: show the cursor again (WASD hides it)
+    const b = def.cursor.bounds;
+    const k = ((b[2] - b[0]) / CURSOR_DEG_SPAN) * (def.cursor.sensitivity ?? 1) * (session.sens ?? 1);
+    // turning right raises the yaw; looking down raises the pitch
+    session.cx = clamp(session.cx + dYaw * k * MODEL_RIGHT_SIGN, b[0], b[2]);
+    session.cy = clamp(session.cy - dPitch * k, b[1], b[3]);
+    pushCursor(session);
+    const h = hoverIndex(session);
+    session.hover = h;
+    if (h >= 0 && h !== session.focus) setFocus(session, h);
+}
+
+/** Left/right click with the mouse: presses the button under the cursor. */
+export function mouseClick(session) {
+    if (!session.active || session.closing || !session.mouse) return;
+    if (session.calib) {
+        acceptFocus(session);
+        return;
+    }
+    // cursor hidden by WASD: the click presses the button chosen with the keys
+    if (session.cursorHidden || (session.hover >= 0 && session.hover === session.focus)) acceptFocus(session);
 }
 
 // ---------- input ----------
@@ -550,12 +704,26 @@ function tickSession(session) {
         if (tickCount % REFRESH_TICKS === 0) refreshSession(session);
         return;
     }
+    if (session.revealed) {
+        const wantMouse = mouseWanted(session);
+        if (wantMouse && !session.mouse) enterMouse(session);
+        else if (!wantMouse && session.mouse) leaveMouse(session);
+        if (session.mouse) cursorTick(session);
+    }
     const dir = readDir(player);
     if (dir === null) session.lastDir = null;
     else if (dir !== session.lastDir && tickCount - session.lastMoveTick >= MOVE_DELAY_TICKS) {
         session.lastDir = dir;
         session.lastMoveTick = tickCount;
+        const before = session.focus;
         setFocus(session, nextFocus(session, dir));
+        if (session.mouse) {
+            // WASD while using the mouse: hide the cursor (it comes back on the focused button when the mouse moves)
+            session.cursorHidden = true;
+            if (session.focus !== before) cursorToFocus(session);
+            session.hover = session.focus;
+            pushCursor(session);
+        }
     }
     if (tickCount % REFRESH_TICKS === 0) refreshSession(session);
 }

@@ -33,6 +33,7 @@ RP las lee con `q.property(...)`.
     "fade": { "in": 0.15, "hold": 0.3, "out": 0.35, "color": "#000000" }, // opcional; def. con estos valores; false = sin fundido (segundos)
     "hide_hud": true,                 // def. true: oculta el HUD (menos el actionbar) mientras la UI está abierta
     "calibrate": true,                // def. true: la primera vez que un jugador abre una UI calibra el tamaño (ver 4)
+    "cursor": { "sensitivity": 1 },   // opcional; def. activado; false = sin cursor de ratón (ver 4, "Cursor")
     "sounds": { "move": "random.click", "accept": "random.orb", "open": "random.pop", "close": "random.pop" } // opcional
   },
   "open": [                           // uno o varios métodos
@@ -79,6 +80,7 @@ su pantalla.
 | `goto` | `screen` | cambia de pantalla (se apila para `back`) |
 | `back` | — | pantalla anterior; si no hay, cierra |
 | `close` | — | cierra la UI |
+| `settings` | — | abre el formulario de ajustes (`@minecraft/server-ui` ModalForm, la UI sigue abierta detrás): sensibilidad del ratón (deslizador en % de 20 a 300 en pasos de 10, porque los sliders de Bedrock solo manejan enteros; se guarda como 0.2..3 en la dynamic property del jugador `bb_ui:cursor_sens`; sin tooltips, que tapan el deslizador) y, si la UI calibra, "Recalibrar" (entra en calibración sin cerrar). Si alguna UI la usa, el filtro añade `@minecraft/server-ui` 2.0.0 al manifest cuando falta |
 | `open_ui` | `ui` (id de otra UI) | cierra la UI actual y abre la otra para el mismo jugador (misma fuente `source`); si el id no existe, `console.warn` y no hace nada. El filtro avisa si `ui` no está entre las UIs del build |
 | `command` | `command` (sin `/`), `as`: `"player"` (def.) \| `"server"` | `player.runCommand` o `dimension.runCommand`; `{player}` se sustituye por el nombre |
 | `script` | `fn`, `args` (objeto opcional) | llama a la función registrada con `registerUiFunction` |
@@ -203,6 +205,24 @@ Es un aviso (`console.warn`): un hueso animado (clave de `bones`) que no está e
 - HUD (`display.hide_hud`): al abrir `onScreenDisplay.setHudVisibility(HudVisibility.Hide, [PaperDoll, Armor, ToolTips, Crosshair, Hotbar, Health,
   ProgressBar, Hunger, AirBubbles, HorseHealth, StatusEffects, ItemText])`. El actionbar no es un `HudElement`, por lo que no se oculta;
   `TouchControls` se deja visible (hacen falta para Saltar/Agachar en móvil). Al cerrar (toda ruta) `resetHudElementsVisibility()`.
+- Cursor (`display.cursor`, def. activado): mientras `player.inputInfo.lastInputModeUsed === InputMode.KeyboardAndMouse` la cámara
+  del jugador se desbloquea (la vista sigue fija en la UI) y el giro del jugador mueve un cursor: girar `120 / sensitivity` grados
+  recorre todo el ancho de la UI (derecha = +X del modelo, mirar abajo = cursor abajo); el pitch vuelve a 0 al pasar de ±45°. El botón
+  visible cuyo rectángulo (bbox de sus cubos + 0.75 px, mínimo 6x6 px) contiene la punta recibe el foco. Clic = cualquier vía por la que
+  llegue: `playerSwingStart`, `entityHitBlock`, y los eventos before `playerBreakBlock`, `playerInteractWithBlock`,
+  `playerInteractWithEntity`, `itemUse` y `entityHurt` (atacante = el jugador), que además se cancelan (con la UI abierta no se rompen
+  bloques ni se hiere a mobs); se deduplican 4 ticks por jugador. El clic pulsa el botón bajo el cursor. WASD oculta el cursor
+  (`NS:cur` = false) y lo lleva al botón enfocado; con el cursor oculto el clic pulsa el botón enfocado; al mover el ratón reaparece.
+  Filtro: propiedades `NS:cur` (bool) y `NS:cx`/`NS:cy` (float, px del modelo; cuentan 3 en el límite de 32), geometría
+  `geometry.bb_ui.<ID>.cursor` (hueso `__bbui_cursor` bajo `__bbui_yaw`, alto = 4.5% del de la UI), textura
+  `textures/bb_ui/<ID>_cursor.png` (la de `data/bb_ui/<ID>/cursor.png` si existe, punta en el píxel de arriba a la izquierda; si no, una
+  flecha generada), render controller `controller.render.bb_ui.<ID>.cursor` (último: se dibuja encima, material `bb_ui.xray`, visible
+  con `viewer && NS:cur`) y `animation.bb_ui.<ID>.cursor` (`position = [NS:cx, NS:cy, 0]`). El registro lleva
+  `cursor: { sensitivity, bounds: [x0,y0,x1,y1], rects: { <hueso>: [x0,y0,x1,y1] } }` (null si `cursor:false`).
+  Velocidad final = `ancho / 120°` × `display.cursor.sensitivity` × sensibilidad del jugador (`bb_ui:cursor_sens`, def. 1). Tras
+  recentrar el pitch se ignoran 4 ticks de giro y cualquier giro de más de 35° en un tick (resincronización, no ratón).
+  Rectángulos de clic: bbox + 1.2% del alto de la UI, mínimo 5% del alto; si se solapan gana el centro más cercano.
+  Tooltips: no hay campo propio; el hueso `highlight` solo se ve con el foco, así que un texto dentro de él hace de tooltip.
 - Calibración (`display.calibrate`, def. true): dynamic property del jugador `bb_ui:scale` (número, sin valor por defecto). Distancia efectiva =
   `display.distance / scale` (escala fijada a 0.5..2.0; si la UI tiene `calibrate:false` se ignora). Al abrir cualquier UI con `bb_ui:scale`
   sin definir se hace primero una sesión de calibración en esa misma UI: se muestra normal + `NS:calib = true` (esquinas de `bbox`), el actionbar

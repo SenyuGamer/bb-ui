@@ -7,6 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const { Canvas } = require('./lib/png.js');
+const SERVER_UI_VERSION = '2.0.0';
 const MIN_SERVER_VERSION = '2.8.0'; // lowest version checked: all runtime APIs are in the 2.8.0 typings; it may also work on older versions
 
 function readSettings() {
@@ -150,6 +151,10 @@ function validate(uiId, ui, geoBones, usedGlobal) {
       }
       if (fd.color !== undefined && !hexOk(fd.color)) err(uiId, 'display.fade.color debe ser "#rrggbb"');
     }
+    const cu = sub('cursor');
+    if (cu && cu.sensitivity !== undefined && !(typeof cu.sensitivity === 'number' && cu.sensitivity > 0)) {
+      err(uiId, 'display.cursor.sensitivity debe ser un numero > 0');
+    }
     for (const k of ['hide_hud', 'calibrate']) {
       if (d[k] !== undefined && typeof d[k] !== 'boolean') err(uiId, `display.${k} debe ser booleano`);
     }
@@ -223,6 +228,9 @@ function validate(uiId, ui, geoBones, usedGlobal) {
         break;
       case 'back':
       case 'close':
+        break;
+      case 'settings':
+        usedGlobal.settings = true;
         break;
       case 'open_ui':
         if (typeof a.ui !== 'string' || !a.ui) err(uiId, `${where}: open_ui necesita ui (string)`);
@@ -312,7 +320,8 @@ function validate(uiId, ui, geoBones, usedGlobal) {
     maxButtons = Math.max(maxButtons, buttons.length);
   }
 
-  const baseProps = 4 + (d && d.calibrate === false ? 0 : 1) + (d && d.backdrop === false ? 0 : 1); // viewer, screen, focus, yaw (+ calib) (+ bd)
+  // viewer, screen, focus, yaw (+ calib) (+ bd) (+ cur, cx, cy)
+  const baseProps = 4 + (d && d.calibrate === false ? 0 : 1) + (d && d.backdrop === false ? 0 : 1) + (d && d.cursor === false ? 0 : 3);
   const propCount = baseProps + numberCount + condCount;
   if (propCount > MAX_PROPERTIES) {
     err(uiId, `demasiadas propiedades de entidad: ${propCount} (maximo ${MAX_PROPERTIES}: ${baseProps} base + ${numberCount} numeros + ${condCount} visible_if)`);
@@ -559,6 +568,86 @@ function buildBackdropGeo(ID, bb, centerYpx, withBackdrop, withCalib) {
         visible_bounds_offset: [0, 1, 0],
       },
       bones: wrapYaw(bones),
+    }],
+  };
+}
+
+// ---- mouse cursor (keyboard + mouse players): own geometry/texture, drawn after the UI, moved by NS:cx / NS:cy
+// Default arrow, tip at the top-left: X = outline, w = fill, s = fill shade, . = transparent.
+// A UI can ship its own data/bb_ui/<ID>/cursor.png (tip at the top-left pixel).
+const CURSOR_ART = [
+  'X..........',
+  'XX.........',
+  'XwX........',
+  'XwwX.......',
+  'XwwwX......',
+  'XwwwwX.....',
+  'XwwwwwX....',
+  'XwwwwwwX...',
+  'XwwwwwwsX..',
+  'XwwwwwsssX.',
+  'XwwwwwXXXXX',
+  'XwwXwwX....',
+  'XwX.XwsX...',
+  'XX..XwsX...',
+  'X....XwsX..',
+  '.....XwsX..',
+  '......XX...',
+];
+const CURSOR_COLORS = { X: [43, 27, 18], w: [250, 243, 226], s: [214, 196, 160] };
+const CURSOR_HEIGHT = 0.045; // fraction of the UI height
+const CURSOR_FLIP_U = false;
+// cursor hit test, as fractions of the UI height (UIs can be a few px or hundreds of px tall)
+const HIT_PAD = 0.012; // margin added around every button
+const HIT_MIN = 0.05; // smallest hit width/height (small page arrows) // flip if the arrow shows mirrored in game
+function pngSize(file) {
+  const b = fs.readFileSync(file);
+  return [b.readUInt32BE(16), b.readUInt32BE(20)];
+}
+// Writes textures/bb_ui/<ID>_cursor.png; returns its [width, height].
+function writeCursorTexture(ID, outPath) {
+  mkdirp(path.dirname(outPath));
+  const custom = path.join(DATA_DIR, ID, 'cursor.png');
+  if (fs.existsSync(custom)) {
+    fs.copyFileSync(custom, outPath);
+    return pngSize(custom);
+  }
+  const w = CURSOR_ART[0].length, h = CURSOR_ART.length;
+  const img = new Canvas(w, h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const c = CURSOR_COLORS[CURSOR_ART[y][x]];
+      if (c) img.set(x, y, c[0], c[1], c[2], 255);
+    }
+  }
+  fs.writeFileSync(outPath, img.toPng());
+  return [w, h];
+}
+// bb: world bbox in px of the UI. The arrow tip sits at the bone origin; the animation moves it to (cx, cy).
+function cursorPlaneZ(fronts, bb) {
+  if (!fronts.length) return bb.mn[2] - 0.1;
+  const z = [...fronts].sort((a, b) => a - b);
+  return z[Math.floor(z.length / 2)] - 0.1; // median button front, a hair in front of it (the UI faces -Z)
+}
+// z: depth (px) of the plane the cursor is drawn on. It must be the buttons' plane: with perspective, a cursor drawn nearer
+// the camera than the buttons looks shifted away from the centre (seen in game with a close camera).
+function buildCursorGeo(ID, bb, [tw, th], z) {
+  const ch = Math.max(1.5, Math.min(16, CURSOR_HEIGHT * (bb.mx[1] - bb.mn[1])));
+  const cw = (ch * tw) / th;
+  const uv = CURSOR_FLIP_U ? { uv: [tw, 0], uv_size: [-tw, th] } : { uv: [0, 0], uv_size: [tw, th] };
+  return {
+    format_version: '1.12.0',
+    'minecraft:geometry': [{
+      description: {
+        identifier: `geometry.bb_ui.${ID}.cursor`,
+        texture_width: tw,
+        texture_height: th,
+        visible_bounds_width: BACKDROP_BOUNDS,
+        visible_bounds_height: BACKDROP_BOUNDS,
+        visible_bounds_offset: [0, 1, 0],
+      },
+      bones: wrapYaw([{ name: '__bbui_cursor', pivot: [0, 0, 0],
+        cubes: [{ origin: [0, round(-ch), round(z)], size: [round(cw), round(ch), 0], uv: { north: uv } }] }]),
     }],
   };
 }
@@ -927,6 +1016,29 @@ async function generateUi(uiId, ui, geo, ctx) {
     }
   }
 
+  // world-space rect [minX, minY, maxX, maxY] (px) of every button bone: mouse cursor hit test
+  const cursorOn = ui.display?.cursor !== false;
+  const boneRect = {};
+  const buttonFronts = []; // world z (px) of the front face of every button: the cursor plane
+  if (cursorOn) {
+    const byName = new Map(geoDesc.bones.map((b) => [b.name, b]));
+    for (const list of Object.values(buttons)) {
+      for (const name of list) {
+        const b = byName.get(name);
+        const pts = b ? subtreePts(b) : [];
+        if (!pts.length || boneRect[name]) continue;
+        const { mn, mx } = bboxOf(pts);
+        buttonFronts.push(mn[2]);
+        // generous hit area: small buttons (page arrows) are easy to miss with a cursor
+        const w = mx[0] - mn[0], h = mx[1] - mn[1];
+        const uiH = bbPx.mx[1] - bbPx.mn[1];
+        const pad = HIT_PAD * uiH, min = HIT_MIN * uiH;
+        const px = Math.max(pad, (min - w) / 2), py = Math.max(pad, (min - h) / 2);
+        boneRect[name] = [round(mn[0] - px), round(mn[1] - py), round(mx[0] + px), round(mx[1] + py)];
+      }
+    }
+  }
+
   // ---- BP entity
   const props = {};
   props[`${NS}:viewer`] = { type: 'bool', default: false, client_sync: true };
@@ -937,6 +1049,11 @@ async function generateUi(uiId, ui, geo, ctx) {
   // float property: Bedrock rejects integer-looking JSON numbers (0, 16) as float default/range
   props[`${NS}:yaw`] = { type: 'float', range: [-360.5, 360.5], default: 0.0001, client_sync: true };
   if (ui.display?.backdrop !== false) props[`${NS}:bd`] = { type: 'float', range: [0.0001, 16.5], default: 0.0001, client_sync: true };
+  if (cursorOn) {
+    props[`${NS}:cur`] = { type: 'bool', default: false, client_sync: true };
+    props[`${NS}:cx`] = { type: 'float', range: [-4096.5, 4096.5], default: 0.0001, client_sync: true };
+    props[`${NS}:cy`] = { type: 'float', range: [-4096.5, 4096.5], default: 0.0001, client_sync: true };
+  }
   if (plan?.usesClosing) props[`${NS}:closing`] = { type: 'bool', default: false, client_sync: true };
   if (plan?.usesPress) props[`${NS}:press`] = { type: 'int', range: [0, Math.max(maxButtons, 1)], default: 0, client_sync: true };
   for (let k = 0; k < nk; k++) props[`${NS}:n${k}`] = { type: 'int', range: [0, 999999999], default: 0, client_sync: true };
@@ -1070,6 +1187,11 @@ async function generateUi(uiId, ui, geo, ctx) {
     writeBackdropTexture(path.join(T_RP, `textures/bb_ui/${ID}_backdrop.png`), backdrop || BACKDROP_DEFAULT);
   }
 
+  if (cursorOn) {
+    const cursorSize = writeCursorTexture(ID, path.join(T_RP, `textures/bb_ui/${ID}_cursor.png`));
+    writeJson(path.join(T_RP, `models/entity/bb_ui/${ID}_cursor.geo.json`), buildCursorGeo(ID, bbPx, cursorSize, cursorPlaneZ(buttonFronts, bbPx)));
+  }
+
   // ---- render controllers
   const partVis = [{ '*': viewer }];
   for (const b of outBones) {
@@ -1122,6 +1244,17 @@ async function generateUi(uiId, ui, geo, ctx) {
       part_visibility: bv,
     };
   }
+  if (cursorOn) {
+    rcs[`controller.render.bb_ui.${ID}.cursor`] = {
+      geometry: 'Geometry.cursor',
+      materials: [{ '*': 'Material.cursor' }],
+      textures: ['Texture.cursor'],
+      ignore_lighting: true,
+      is_hurt_color: NO_TINT,
+      on_fire_color: NO_TINT,
+      part_visibility: [{ '*': `${viewer} && ${P('cur')}` }],
+    };
+  }
   writeJson(path.join(T_RP, `render_controllers/bb_ui/${ID}.json`), {
     format_version: '1.8.0',
     render_controllers: rcs,
@@ -1164,6 +1297,13 @@ async function generateUi(uiId, ui, geo, ctx) {
     };
     animRefs[name] = full;
     animate.push({ [name]: viewer });
+  }
+  if (cursorOn) {
+    // bone position X here matches geo X (checked in game: -cx showed the cursor mirrored)
+    const full = `animation.bb_ui.${ID}.cursor`;
+    anims[full] = { loop: true, animation_length: 1, bones: { __bbui_cursor: { position: [P('cx'), P('cy'), 0] } } };
+    animRefs.cursor = full;
+    animate.push({ cursor: `${viewer} && ${P('cur')}` });
   }
   // authored animations (animations.json): wiring by role, see CONTRACT 3.1
   for (const a of plan?.list || []) {
@@ -1211,6 +1351,12 @@ async function generateUi(uiId, ui, geo, ctx) {
     desc.geometry.digits = `geometry.bb_ui.${ID}.digits`;
     desc.render_controllers.push(`controller.render.bb_ui.${ID}.digits`);
   }
+  if (cursorOn) {
+    desc.materials.cursor = 'bb_ui.xray';
+    desc.textures.cursor = `textures/bb_ui/${ID}_cursor`;
+    desc.geometry.cursor = `geometry.bb_ui.${ID}.cursor`;
+    desc.render_controllers.push(`controller.render.bb_ui.${ID}.cursor`);
+  }
   if (animate.length) {
     desc.animations = animRefs;
     desc.scripts = { animate };
@@ -1232,6 +1378,11 @@ async function generateUi(uiId, ui, geo, ctx) {
     bonePos,
     centerY,
     bbox,
+    cursor: cursorOn ? {
+      sensitivity: (isObj(ui.display?.cursor) && ui.display.cursor.sensitivity) || 1,
+      bounds: [round(bbPx.mn[0]), round(bbPx.mn[1]), round(bbPx.mx[0]), round(bbPx.mx[1])],
+      rects: boneRect,
+    } : null,
     closeTicks: plan?.closeTicks || 0,
     pressTicks: plan?.pressTicks || 0,
     pressBones: plan && plan.usesPress ? plan.list.filter((a) => a.kind === 'press').map((a) => a.arg) : [],
@@ -1268,7 +1419,7 @@ function checkServerVersion(manifest) {
 }
 
 /** Prepends the runtime import to the BP script entry (creating the script module when there is none). */
-function autoImport() {
+function autoImport(needsServerUi) {
   const manifestPath = path.join(T_BP, 'manifest.json');
   const manifest = readJsonIfExists(manifestPath);
   if (!manifest) {
@@ -1289,6 +1440,12 @@ function autoImport() {
   if (!manifest.dependencies.some((d) => d && d.module_name === '@minecraft/server')) {
     manifest.dependencies.push({ module_name: '@minecraft/server', version: MIN_SERVER_VERSION });
     manifestDirty = true;
+  }
+  // the settings form ({ type: "settings" }) is a @minecraft/server-ui ModalForm
+  if (needsServerUi && !manifest.dependencies.some((d) => d && d.module_name === '@minecraft/server-ui')) {
+    manifest.dependencies.push({ module_name: '@minecraft/server-ui', version: SERVER_UI_VERSION });
+    manifestDirty = true;
+    console.log(`  manifest: added @minecraft/server-ui ${SERVER_UI_VERSION} (settings form)`);
   }
   if (manifestDirty) writeJson(manifestPath, manifest);
 
@@ -1397,7 +1554,7 @@ async function main() {
   mkdirp(path.join(SCRIPTS_DIR, 'generated'));
   fs.writeFileSync(path.join(SCRIPTS_DIR, 'generated/ui_registry.js'), code);
 
-  if (SETTINGS.autoImport) autoImport();
+  if (SETTINGS.autoImport) autoImport(!!usedGlobal.settings);
   else console.log(`  autoImport off: import "scripts/${SETTINGS.scriptsPath}/index.js" from your own script`);
   console.log(`=== Done: ${loaded.length} UI(s) ===`);
 }

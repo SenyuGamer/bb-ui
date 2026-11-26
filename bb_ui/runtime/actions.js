@@ -2,6 +2,7 @@
 import { system } from "@minecraft/server";
 import { UI_REGISTRY } from "./generated/ui_registry.js";
 import { gotoScreen, backScreen, closeSession, refreshSession, openSession } from "./session.js";
+import { openSettings } from "./settings.js";
 
 const uiFunctions = new Map();
 
@@ -26,6 +27,9 @@ export function runAction(session, action, bone) {
             break;
         case "close":
             closeSession(session, "action");
+            break;
+        case "settings":
+            openSettings(session).catch((e) => console.warn(`[bb_ui] settings failed: ${e}`));
             break;
         case "open_ui": {
             if (typeof action.ui !== "string" || !UI_REGISTRY[action.ui]) {
