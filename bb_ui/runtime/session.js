@@ -28,6 +28,17 @@ export const CURSOR_SENS_MIN = 0.2;
 export const CURSOR_SENS_MAX = 3;
 
 export const SCALE_KEY = "bb_ui:scale";
+
+// per-player language (shared by all UIs): language code, see "languages" in ui.json
+export const LANG_KEY = "bb_ui:lang";
+
+/** Code of the player's language among def.languages (the first one when unset or unknown); null when the UI has no languages. */
+export function readLangCode(player, def) {
+    const langs = def?.languages;
+    if (!Array.isArray(langs) || langs.length < 2) return null;
+    const v = player.getDynamicProperty(LANG_KEY);
+    return typeof v === "string" && langs.includes(v) ? v : langs[0];
+}
 const CALIB_MIN = 0.5;
 const CALIB_MAX = 2.0;
 const CALIB_STEP = 0.02;
@@ -104,6 +115,13 @@ function applyEarlyProps(session) {
     }
     for (const n of m.numbers) setProp(session, `n${n.k}`, getQueryNumber(player, def, n.query));
     for (const c of m.conds) setProp(session, `v${c.k}`, evalCondition(player, def, c.cond));
+    applyLangProp(session);
+}
+
+/** `lang` entity property = index of the player's language in def.languages (only UIs with 2+ languages have it). */
+function applyLangProp(session) {
+    const code = readLangCode(session.player, session.def);
+    if (code !== null) setProp(session, "lang", session.def.languages.indexOf(code));
 }
 
 function applyAllProps(session) {
@@ -519,6 +537,7 @@ export function readCursorSens(player) {
 export function applySettings(session, { recalibrate = false } = {}) {
     if (!session.active) return;
     session.sens = readCursorSens(session.player);
+    applyLangProp(session);
     session.prevRot = undefined;
     session.cursorSkipUntil = tickCount + CURSOR_RESYNC_TICKS;
     if (recalibrate && calibrationEnabled(session.def)) {

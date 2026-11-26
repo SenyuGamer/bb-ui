@@ -117,6 +117,31 @@ function boneBounds(bone) {
 }
 
 // ---------------------------------------------------------------- validation + normalization
+// languages / translations (CONTRACT "Idiomas"): active only with more than one language
+const LANG_RE = /^[a-z]{2,3}(_[a-z]{2})?$/i;
+function langActive(ui) {
+  return Array.isArray(ui.languages) && ui.languages.length > 1;
+}
+function validateLanguages(uiId, ui, geoBones) {
+  if (ui.languages !== undefined) {
+    if (!Array.isArray(ui.languages) || ui.languages.some((c) => typeof c !== 'string' || !LANG_RE.test(c))) {
+      err(uiId, 'languages debe ser una lista de codigos de idioma (ej. ["es","en"])');
+      return;
+    }
+    if (new Set(ui.languages).size !== ui.languages.length) err(uiId, 'languages tiene codigos repetidos');
+  }
+  if (ui.translations === undefined) return;
+  if (!isObj(ui.translations)) { err(uiId, 'translations debe ser un objeto { hueso: codigo }'); return; }
+  if (!langActive(ui)) {
+    if (Object.keys(ui.translations).length) console.warn(`[bb_ui] aviso: ${uiId}: translations se ignora sin "languages" de 2 o mas idiomas`);
+    return;
+  }
+  for (const [bone, code] of Object.entries(ui.translations)) {
+    if (!geoBones.has(bone)) err(uiId, `translations: el hueso "${bone}" no existe en la geometria`);
+    if (!ui.languages.includes(code)) err(uiId, `translations.${bone}: "${code}" no esta en languages`);
+  }
+}
+
 function validate(uiId, ui, geoBones, usedGlobal) {
   if (ui.format_version !== 1) err(uiId, 'format_version debe ser 1');
   if (ui.id !== uiId) err(uiId, `id "${ui.id}" no coincide con la carpeta "${uiId}"`);
@@ -126,6 +151,7 @@ function validate(uiId, ui, geoBones, usedGlobal) {
     return null;
   }
   const NS = ui.namespace;
+  validateLanguages(uiId, ui, geoBones);
   const d = ui.display;
   if (!isObj(d)) err(uiId, 'falta "display"');
   else {
@@ -324,9 +350,10 @@ function validate(uiId, ui, geoBones, usedGlobal) {
 
   // viewer, screen, focus, yaw (+ calib) (+ bd) (+ cur, cx, cy)
   const baseProps = 4 + (d && d.calibrate === false ? 0 : 1) + (d && d.backdrop === false ? 0 : 1) + (d && d.cursor === false ? 0 : 3);
-  const propCount = baseProps + numberCount + condCount;
+  const langCount = langActive(ui) ? 1 : 0;
+  const propCount = baseProps + numberCount + condCount + langCount;
   if (propCount > MAX_PROPERTIES) {
-    err(uiId, `demasiadas propiedades de entidad: ${propCount} (maximo ${MAX_PROPERTIES}: ${baseProps} base + ${numberCount} numeros + ${condCount} visible_if)`);
+    err(uiId, `demasiadas propiedades de entidad: ${propCount} (maximo ${MAX_PROPERTIES}: ${baseProps} base + ${numberCount} numeros + ${condCount} visible_if + ${langCount} idioma)`);
   }
   return { NS, maxButtons, propCount };
 }
@@ -1060,6 +1087,7 @@ async function generateUi(uiId, ui, geo, ctx) {
   if (plan?.usesPress) props[`${NS}:press`] = { type: 'int', range: [0, Math.max(maxButtons, 1)], default: 0, client_sync: true };
   for (let k = 0; k < nk; k++) props[`${NS}:n${k}`] = { type: 'int', range: [0, 999999999], default: 0, client_sync: true };
   for (let k = 0; k < vk; k++) props[`${NS}:v${k}`] = { type: 'bool', default: false, client_sync: true };
+  if (langActive(ui)) props[`${NS}:lang`] = { type: 'int', range: [0, Math.max(ui.languages.length - 1, 1)], default: 0, client_sync: true };
   const entityId = `${NS}:ui_${ID}`;
   writeJson(path.join(T_BP, `entities/bb_ui/${ID}.json`), {
     format_version: '1.21.0',
@@ -1142,11 +1170,17 @@ async function generateUi(uiId, ui, geo, ctx) {
     ownExpr.set(bone, uniq.length === 1 ? uniq[0] : uniq.map((c) => `(${c})`).join(' || '));
   }
   const parentOf = new Map(geoDesc.bones.map((b) => [b.name, b.parent]));
+  // language conditions are ANDed (never OR-joined like screen conditions): bone -> expression
+  const langExpr = new Map();
+  if (langActive(ui) && isObj(ui.translations)) {
+    for (const [bone, code] of Object.entries(ui.translations)) langExpr.set(bone, `${P('lang')} == ${ui.languages.indexOf(code)}`);
+  }
   // effective condition of a bone ('' = none): its own ANDed with all ancestors'
   const visOf = (name) => {
     const chain = [];
     for (let n = name, guard = 0; n && guard < 64; n = parentOf.get(n), guard++) {
       if (ownExpr.has(n)) chain.push(ownExpr.get(n));
+      if (langExpr.has(n)) chain.push(langExpr.get(n));
     }
     return chain.map((c) => `(${c})`).join(' && ');
   };

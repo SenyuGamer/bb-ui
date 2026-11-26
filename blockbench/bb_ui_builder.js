@@ -98,10 +98,19 @@
                 for (const a of core.actionsOf(e.action)) if (a.bone === from) a.bone = sw(a.bone);
             }
         }
-        const tips = data.editor && data.editor.tooltips;
-        if (tips && Object.prototype.hasOwnProperty.call(tips, from) && !Object.prototype.hasOwnProperty.call(tips, to)) {
-            core.set(tips, to, tips[from]);
-            core.del(tips, from);
+        // editor-only records keyed by bone name follow the rename (tooltips, hand-marked piece types)
+        for (const key of ['tooltips', 'types', 'texts']) {
+            const rec = data.editor && data.editor[key];
+            if (rec && Object.prototype.hasOwnProperty.call(rec, from) && !Object.prototype.hasOwnProperty.call(rec, to)) {
+                core.set(rec, to, rec[from]);
+                core.del(rec, from);
+                n++;
+            }
+        }
+        const tr = data.translations; // a language-specific bone keeps its language when renamed
+        if (tr && Object.prototype.hasOwnProperty.call(tr, from) && !Object.prototype.hasOwnProperty.call(tr, to)) {
+            core.set(tr, to, tr[from]);
+            core.del(tr, from);
             n++;
         }
         return n;
@@ -198,7 +207,40 @@
             if (e.type === 'number') n++;
             if (e.visible_if) n++;
         }
+        if (core.isMulti(data)) n++; // <ns>:lang, added by the filter when the UI has 2+ languages
         return n;
+    };
+
+    // ---- languages (CONTRACT "Idiomas"): data.languages = ['es','en',...] (first = default, active with 2+), data.translations = { bone: code }
+    core.LANGS = [['es', 'Español'], ['en', 'English'], ['pt', 'Português'], ['fr', 'Français'], ['de', 'Deutsch'], ['it', 'Italiano'], ['ja', '日本語'], ['ko', '한국어'], ['zh', '中文'], ['ru', 'Русский']];
+    core.langName = function (code) { const l = core.LANGS.find((x) => x[0] === code); return l ? l[1] : String(code); };
+    core.isMulti = function (data) { return !!data && Array.isArray(data.languages) && data.languages.length > 1; };
+    core.defLang = function (data) { return (data && Array.isArray(data.languages) && data.languages[0]) || 'es'; };
+    // Text of a language from a { code: string } map: its own, else the default language's, else the first one that has text.
+    core.textFor = function (map, code, data) {
+        map = map || {};
+        const v = (c) => (typeof map[c] === 'string' && map[c].trim() ? map[c] : '');
+        return v(code) || v(core.defLang(data)) || Object.keys(map).map(v).find(Boolean) || '';
+    };
+    // Characters of text that the font cannot draw (layoutText drops them; it also tries the other letter case). Whitespace is ignored.
+    core.missingChars = function (font, text) {
+        const out = [], gl = (font && font.glyphs) || {};
+        for (const ch of Array.from(String(text || ''))) {
+            if (/\s/.test(ch)) continue;
+            if (!(gl[ch] || gl[ch.toLowerCase()] || gl[ch.toUpperCase()]) && !out.includes(ch)) out.push(ch);
+        }
+        return out;
+    };
+    // Makes the exported ui.json valid for the filter (it errors on missing bones): unique languages, and translations only with
+    // 2+ languages, an existing bone and a listed code. Mutates and returns ui.
+    core.cleanLanguages = function (ui, boneNames) {
+        const langs = Array.isArray(ui.languages) ? ui.languages.filter((c, i, a) => typeof c === 'string' && c && a.indexOf(c) === i) : [];
+        if (langs.length < 2) { delete ui.languages; delete ui.translations; return ui; }
+        ui.languages = langs;
+        const names = new Set(boneNames || []), out = {};
+        for (const k of Object.keys(ui.translations || {})) if (names.has(k) && langs.includes(ui.translations[k])) out[k] = ui.translations[k];
+        if (Object.keys(out).length) ui.translations = out; else delete ui.translations;
+        return ui;
     };
 
     core.validate = function (data, boneNames) {
@@ -297,6 +339,17 @@
             else if (q.source === 'script' && !q.fn) E('Query ' + k + ': falta fn.');
             else if (!['dynamic_property', 'scoreboard', 'script'].includes(q.source)) E('Query ' + k + ': source invalido.');
         }
+        if (data.languages !== undefined) {
+            if (!Array.isArray(data.languages)) E('languages debe ser una lista de codigos.');
+            else {
+                const seen = new Set();
+                for (const c of data.languages) {
+                    if (!ID_RE.test(String(c))) E('Idioma con codigo invalido "' + c + '" (usa [a-z0-9_]+).');
+                    else if (seen.has(c)) E('Idioma repetido "' + c + '".');
+                    seen.add(c);
+                }
+            }
+        }
         const props = core.countProps(data);
         if (props > 32) E('Demasiadas propiedades de entidad: ' + props + ' (max 32).');
         return { errors, warnings };
@@ -314,14 +367,15 @@
     core.set = (o, k, v) => Vue.set(o, k, v);
     core.del = (o, k) => Vue.delete(o, k);
 
-    const state = { data: null, activeScreen: '', showAll: false, showTips: true, safe: true, showSettings: false, showAnims: false, sel: '', rev: 0, groups: [], textures: [], animNames: [], profile: 'default', building: false, dev: false, piece: '', preview: { on: false, focus: '', stack: [] } };
+    const state = { data: null, activeScreen: '', showAll: false, showTips: true, safe: true, showSettings: false, showAnims: false, sel: '', grp: '', rev: 0, groups: [], textures: [], animNames: [], profile: 'default', building: false, dev: false, piece: '', lang: '', preview: { on: false, focus: '', stack: [] } };
     const MODE_ID = 'bb_ui_mode';
     const DEV_KEY = 'bb_ui_builder_dev';
     const COMUNES = 'comunes';
     // Camera preset (id in DefaultCameraPresets) used to look at the UI "like the game". Change it here if text reads mirrored/backwards.
     const VIEW_PRESET = 'north';
-    // Built-in panels that also show in the UI mode (to select bones and paint): their condition gets MODE_ID while loaded.
-    const SHARED_PANELS = ['outliner', 'textures'];
+    // Built-in panels that also show in the UI mode: none. The artist picks pieces from the "Piezas" list of the UI panel, so
+    // the outliner (bones/cubes) and the textures panel stay out of the UI mode. (Their condition gets MODE_ID if listed here.)
+    const SHARED_PANELS = [];
     let panels = [], actions = [], listeners = [], selListener = null, styleEl = null, formatObj = null, pollTimer = null, keyHandler = null, modeObj = null;
     const patchedPanels = [];
     const menus = [];
@@ -514,6 +568,7 @@
         const name = resolveOwner(currentSelectionNode()).sel;
         if (state.sel !== name) state.sel = name;
         try { const pc = artistPiece(currentSelectionNode()), pn = pc ? pc.name : ''; if (state.piece !== pn) state.piece = pn; } catch (e) {}
+        try { const nd = currentSelectionNode(), gn = nd instanceof Group ? nd.name : (nd && nd.parent instanceof Group ? nd.parent.name : ''); if (state.grp !== gn) state.grp = gn; } catch (e) {}
         const names = boneNames();
         if (names.join('|') !== state.groups.join('|')) state.groups = names;
         try {
@@ -544,6 +599,7 @@
         // highlight bone -> its button, to show it only while that button is selected (like focus in game)
         const hlOwner = {};
         for (const s of d.screens) for (const e of s.elements || []) if (e.highlight) hlOwner[e.highlight] = e.bone;
+        const multiLang = core.isMulti(d), langNow = curLang(d), trMap = d.translations || {};
         const artist = !state.dev && !state.showAll;
         const notExported = (g) => { for (let p = g; p instanceof Group; p = p.parent) if (p.export === false) return true; return false; };
         for (const g of Group.all || []) {
@@ -554,6 +610,8 @@
                 if (hlOwner[g.name] && g.visibility) g.visibility = state.sel === hlOwner[g.name];
                 if (notExported(g)) g.visibility = false; // editor-only pieces (font sheets, parts not exported) stay out of the way
             }
+            // a piece of another language is hidden too (it must pass the window rule AND the language rule)
+            if (multiLang) { const lc = trMap[g.name]; if (lc && d.languages.includes(lc) && lc !== langNow) g.visibility = false; }
         }
         // Blockbench does not hide a group's cubes with the group: propagate to every cube from its ancestors.
         for (const c of Cube.all || []) {
@@ -819,6 +877,7 @@
         Undo.initEdit({ outliner: true, elements: [], groups: [] });
         const q = flatGroup(name, p.x, p.y, p.z, w, h, uv, parent);
         Undo.finishEdit('Add UI image', { outliner: true, elements: [q.cube], groups: [q.group] });
+        if (artist) markStoredType(d, name, 'image');
         finishNewElement(d, screen, name, q.group, 'image', artist);
         return name;
     }
@@ -980,9 +1039,24 @@
         const parent = artist ? ensureFolder(screen) : selectedGroup();
         const name = opts.name && !boneNames().includes(opts.name) ? opts.name : nextName('txt');
         const p = placement(screen, parent);
+        // the source is kept in editor.texts so the text can be edited / translated later (each language gets its own child group)
+        const rec = { font: opts.font, scale: opts.scale > 0 ? opts.scale : 1, align: opts.align || 'left', cx: p.x, cy: p.y, z: p.z, text: { [editLang(d)]: text } };
+        const acc = { groups: [], cubes: [] };
         Undo.initEdit({ outliner: true, elements: [], groups: [] });
-        const t = buildTextGroup({ name, font, text, scale: opts.scale, align: opts.align, cx: p.x, cy: p.y, z: p.z, parent });
-        Undo.finishEdit('Add UI text', { outliner: true, elements: t.cubes, groups: [t.group] });
+        let t;
+        if (core.isMulti(d)) {
+            const g = new Group({ name, origin: [p.x, p.y, p.z] }).init();
+            if (parent) g.addTo(parent);
+            acc.groups.push(g);
+            textBuild(d, g, rec, acc);
+            t = { group: g, cubes: acc.cubes };
+        } else {
+            t = buildTextGroup({ name, font, text, scale: opts.scale, align: opts.align, cx: p.x, cy: p.y, z: p.z, parent });
+            acc.groups.push(t.group);
+        }
+        Undo.finishEdit('Add UI text', { outliner: true, elements: t.cubes, groups: acc.groups });
+        setTextRec(d, name, rec);
+        markStoredType(d, name, 'text'); // an element of type image in Modo programador; the stored type tells text from image
         finishNewElement(d, screen, name, t.group, 'image', artist);
         return name;
     }
@@ -995,8 +1069,8 @@
         const tex = mainTexture(), k = uvScale(tex);
         const W = lay.width * scale, H = lay.height * scale;
         const cubes = [];
-        const group = new Group({ name: o.name, origin: [o.cx, o.cy, o.z] }).init();
-        if (o.parent) group.addTo(o.parent);
+        const group = o.into || new Group({ name: o.name, origin: [o.cx, o.cy, o.z] }).init(); // o.into = an existing (empty) group to fill
+        if (!o.into && o.parent) group.addTo(o.parent);
         lay.glyphs.forEach((g, i) => {
             const xl = o.cx + W / 2 - g.x * scale; // screen-left = model +X
             const yt = o.cy + H / 2 - g.y * scale;
@@ -1110,9 +1184,12 @@
         if (!btn) throw new Error('No existe el grupo "' + bone + '".');
         const font = d.fonts && d.fonts[rec.font];
         if (!font) throw new Error('Tooltip de ' + bone + ': fuente "' + rec.font + '" no definida.');
-        const text = String(rec.text || '');
-        const lay = core.layoutText(font, text, 'center');
-        if (!lay.glyphs.length) throw new Error('Tooltip de ' + bone + ': ningun caracter existe en la fuente.');
+        // one text per language (the background is shared and sized for the biggest one); no languages: the single text
+        const multi = core.isMulti(d), map = tipMap(d, rec);
+        const items = (multi ? d.languages.map((code) => ({ code, text: core.textFor(map, code, d) })) : [{ code: '', text: String(rec.text || '') }])
+            .map((it) => Object.assign(it, { lay: core.layoutText(font, it.text, 'center') })).filter((it) => it.text.trim() && it.lay.glyphs.length);
+        if (!items.length) throw new Error('Tooltip de ' + bone + ': ningun caracter existe en la fuente.');
+        const lay = { width: Math.max(...items.map((it) => it.lay.width)), height: Math.max(...items.map((it) => it.lay.height)) };
         // Buttons inside rotated groups (e.g. the guide book, laid down and turned -90 deg): measure in model space
         // (world bounds) and build the tip inside counter-rotated wrappers, where the axes are the upright model's again.
         const rotAnc = [];
@@ -1155,33 +1232,43 @@
             const q = flatGroup(tipName + '_bg', cx, cy, z, tw, th, rec.bg, tip);
             acc.groups.push(q.group); acc.cubes.push(q.cube);
         }
-        const t = buildTextGroup({ name: tipName + '_txt', font, text, scale: 1, align: 'center', cx, cy, z: z - 0.2, parent: tip });
-        acc.groups.push(t.group); acc.cubes.push(...t.cubes);
+        for (const it of items) {
+            const t = buildTextGroup({ name: tipName + (it.code ? '_txt_' + it.code : '_txt'), font, text: it.text, scale: 1, align: 'center', cx, cy, z: z - 0.2, parent: tip });
+            if (!t) continue;
+            acc.groups.push(t.group); acc.cubes.push(...t.cubes);
+            if (it.code) regTr(d, t.group.name, it.code);
+        }
         core.set(rec, 'uuid', (outer || tip).uuid);
         return tip;
+    }
+    // Removes and rebuilds the tooltip group of a button (no Undo). og = its current group (or null). -> true when a tooltip exists afterwards.
+    function tipRegen(d, bone, og, acc) {
+        const rec = tooltipRec(bone);
+        if (og) { dropTr(d, og); removeGroupTree(og); }
+        if (rec && rec.uuid) core.del(rec, 'uuid');
+        const has = tipHasText(d, rec);
+        if (has) tipBuild(d, bone, rec, acc);
+        return has;
     }
     // Rebuilds (or removes, when the text is empty) the tooltip of a button. Returns true when a tooltip group exists afterwards.
     function generateTooltip(bone) {
         const d = needProject();
-        const rec = tooltipRec(bone);
         const f = core.findBone(d, bone);
         if (!f || !f.element || f.element.type !== 'button') throw new Error('"' + bone + '" no es un boton.');
         const old = findTipGroup(bone);
         const oldG = [], oldC = [];
         if (old) collectTree(old, oldG, oldC);
         const acc = { groups: [], cubes: [] };
-        const text = rec ? String(rec.text || '').trim() : '';
+        let has = false;
         Undo.initEdit({ outliner: true, elements: oldC, groups: oldG });
         try {
-            if (old) removeGroupTree(old);
-            if (rec && rec.uuid) core.del(rec, 'uuid');
-            if (text) tipBuild(d, bone, rec, acc);
+            has = tipRegen(d, bone, old, acc);
         } finally {
             Undo.finishEdit('Generate UI tooltip', { outliner: true, elements: acc.cubes, groups: acc.groups });
             try { Canvas.updateAll(); } catch (e) {}
             touch(); applyVisibility(); applyRoleColors(); syncState();
         }
-        return !!text;
+        return has;
     }
     function scheduleTooltip(bone) {
         clearTimeout(tipTimers[bone]);
@@ -1208,6 +1295,260 @@
         needProject();
         const rec = tooltipRec(bone, true);
         imageDialog({ title: 'UI: fondo del tooltip', initial: rec.bg, onPick: (uv) => setTooltip(bone, { bg: uv.map((n) => Math.round(n)) }) });
+    }
+
+    // ------------------------------------------------------------------ Languages (CONTRACT "Idiomas")
+    // d.languages = ['es','en',...] (first = default, active with 2+) and d.translations = { bone: code } are exported (core.cleanLanguages drops stale
+    // entries). Editor-only sources: editor.texts[bone] = { font, scale, align, cx, cy, z, text: { code: string } } for text pieces and
+    // editor.tooltips[bone] = { text (default language), texts: { code: string }, ... } for tooltips. Generated groups: a text piece `<bone>` holds one
+    // `<bone>_<code>` child per language (single language: the glyphs directly), a tooltip holds `<tip>_txt_<code>` next to its shared background.
+    function curLang(d) { d = d || getData(); const l = d && Array.isArray(d.languages) ? d.languages : []; return l.includes(state.lang) ? state.lang : (l[0] || ''); }
+    function editLang(d) { return curLang(d) || core.defLang(d); } // key the text edits go to
+    function regTr(d, name, code) { if (!d.translations) core.set(d, 'translations', {}); core.set(d.translations, name, code); }
+    function dropTr(d, g) {
+        if (!d.translations) return;
+        const walk = (x) => {
+            if (Object.prototype.hasOwnProperty.call(d.translations, x.name)) core.del(d.translations, x.name);
+            for (const c of x.children || []) if (c instanceof Group) walk(c);
+        };
+        walk(g);
+    }
+    function textRec(bone) { const d = getData(); return (d && d.editor && d.editor.texts && d.editor.texts[bone]) || null; }
+    function setTextRec(d, bone, rec) {
+        const ed = editorData();
+        if (!ed.texts) core.set(ed, 'texts', {});
+        core.set(ed.texts, bone, rec);
+    }
+    // tooltip texts by language: rec.text is the default language, rec.texts the others
+    function tipMap(d, rec) { const m = Object.assign({}, rec && rec.texts); m[core.defLang(d)] = String((rec && rec.text) || ''); return m; }
+    function tipHasText(d, rec) {
+        if (!rec) return false;
+        if (!core.isMulti(d)) return !!String(rec.text || '').trim();
+        return Object.values(tipMap(d, rec)).some((v) => String(v || '').trim());
+    }
+    // Fills the (empty) group g of a text piece from its record; no Undo. acc receives what is created.
+    function textBuild(d, g, rec, acc) {
+        const font = d.fonts && d.fonts[rec.font];
+        if (!font) throw new Error('Texto «' + g.name + '»: la letra "' + rec.font + '" no existe.');
+        const o = Array.isArray(g.origin) && g.origin.length >= 3 ? g.origin : [rec.cx, rec.cy, rec.z]; // the group origin follows the piece when it is moved
+        const base = { font, scale: rec.scale, align: rec.align, cx: o[0], cy: o[1], z: o[2] };
+        if (core.isMulti(d)) {
+            for (const code of d.languages) {
+                const text = core.textFor(rec.text, code, d);
+                if (!text.trim()) continue;
+                const t = buildTextGroup(Object.assign({ name: g.name + '_' + code, text, parent: g }, base));
+                if (t) { acc.groups.push(t.group); acc.cubes.push(...t.cubes); regTr(d, t.group.name, code); }
+            }
+        } else {
+            const text = core.textFor(rec.text, core.defLang(d), d);
+            if (!text.trim()) return;
+            const t = buildTextGroup(Object.assign({ name: g.name, text, into: g }, base));
+            if (t) acc.cubes.push(...t.cubes);
+        }
+    }
+    // Empties the group of a text piece and builds it again; no Undo.
+    function textFill(d, bone, acc) {
+        const rec = textRec(bone), g = findGroup(bone);
+        if (!rec || !g) return;
+        for (const c of (g.children || []).slice()) {
+            if (c instanceof Group) { dropTr(d, c); removeGroupTree(c); }
+            else { try { c.remove(false); } catch (e) {} }
+        }
+        textBuild(d, g, rec, acc);
+    }
+    // Rebuilds text pieces and tooltips in ONE Undo step. -> array of error messages (a failing item does not stop the others)
+    function regenMany(textBones, tipBones, label) {
+        const d = needProject();
+        const tbs = (textBones || []).filter((b) => textRec(b) && findGroup(b));
+        const pbs = (tipBones || []).filter((b) => { const f = core.findBone(d, b); return f && f.element && f.element.type === 'button'; });
+        if (!tbs.length && !pbs.length) return [];
+        const oldG = [], oldC = [], acc = { groups: [], cubes: [] }, errs = [];
+        for (const b of tbs) for (const c of findGroup(b).children || []) { if (c instanceof Group) collectTree(c, oldG, oldC); else oldC.push(c); }
+        const tipOld = pbs.map((b) => { const og = findTipGroup(b); if (og) collectTree(og, oldG, oldC); return og; });
+        Undo.initEdit({ outliner: true, elements: oldC, groups: oldG });
+        try {
+            for (const b of tbs) { try { textFill(d, b, acc); } catch (e) { errs.push(e.message); } }
+            pbs.forEach((b, i) => { try { tipRegen(d, b, tipOld[i], acc); } catch (e) { errs.push(e.message); } });
+        } finally {
+            Undo.finishEdit(label || 'Update UI texts', { outliner: true, elements: acc.cubes, groups: acc.groups });
+            try { Canvas.updateAll(); } catch (e) {}
+            touch(); applyVisibility(); applyRoleColors(); syncState();
+        }
+        return errs;
+    }
+    function regenText(bone) {
+        const errs = regenMany([bone], [], 'Edit UI text');
+        if (errs.length) throw new Error(errs[0]);
+    }
+    const textTimers = {};
+    function scheduleText(bone) {
+        clearTimeout(textTimers[bone]);
+        textTimers[bone] = setTimeout(() => {
+            delete textTimers[bone];
+            try { if (getData() && textRec(bone)) regenText(bone); }
+            catch (e) { console.warn('BB UI Builder: text', e); Blockbench.showQuickMessage(e.message, 2500); }
+        }, 600);
+    }
+    // patch = { text?, lang? (default: the editing language), font?, scale?, align? }. Rebuilds after a short pause (at once with now = true).
+    function setTextPiece(bone, patch, now) {
+        const d = needProject();
+        const rec = textRec(bone);
+        if (!rec) throw new Error('Este texto se dibujó antes de que existieran los idiomas: se trata como una imagen.');
+        patch = patch || {};
+        if (typeof patch.text === 'string') {
+            if (!rec.text) core.set(rec, 'text', {});
+            core.set(rec.text, patch.lang || editLang(d), patch.text);
+        }
+        if (typeof patch.font === 'string' && d.fonts && d.fonts[patch.font]) core.set(rec, 'font', patch.font);
+        if (patch.scale > 0) core.set(rec, 'scale', patch.scale);
+        if (['left', 'center', 'right'].includes(patch.align)) core.set(rec, 'align', patch.align);
+        touch();
+        if (now) { clearTimeout(textTimers[bone]); return regenText(bone); }
+        scheduleText(bone);
+        return null;
+    }
+    // d.translations[bone] = code (that piece is only visible in that language); '' = every language
+    function setPieceLang(bone, code) {
+        const d = needProject();
+        if (!findGroup(bone)) return;
+        if (!code) { if (d.translations && Object.prototype.hasOwnProperty.call(d.translations, bone)) core.del(d.translations, bone); }
+        else {
+            if (!(d.languages || []).includes(code)) throw new Error('El idioma «' + code + '» no está en el proyecto.');
+            regTr(d, bone, code);
+        }
+        touch(); applyVisibility(); syncState();
+    }
+    function setLang(code) {
+        const d = getData();
+        if (!d || !(d.languages || []).includes(code)) return;
+        state.lang = code;
+        applyVisibility(); syncState();
+        try { Canvas.updateAll(); } catch (e) {}
+    }
+    function regenAll(label) {
+        const d = getData();
+        const tb = Object.keys((d.editor && d.editor.texts) || {});
+        const pb = Object.keys((d.editor && d.editor.tooltips) || {});
+        return regenMany(tb, pb, label);
+    }
+    function languagesChanged(label) {
+        const d = getData();
+        const errs = regenAll(label);
+        const list = d.languages || [];
+        if (d.translations) for (const k of Object.keys(d.translations)) if (!list.includes(d.translations[k])) core.del(d.translations, k);
+        touch(); applyVisibility(); applyRoleColors(); syncState();
+        if (errs.length) Blockbench.showQuickMessage(errs[0], 3500);
+    }
+    function addLanguage(code) {
+        const d = needProject();
+        code = String(code || '').trim().toLowerCase();
+        if (!/^[a-z]{2,3}(_[a-z0-9]+)?$/.test(code)) throw new Error('Código de idioma no válido: «' + code + '».');
+        const list = Array.isArray(d.languages) ? d.languages.slice() : [];
+        if (list.includes(code)) return setLang(code);
+        if (!list.length && code !== 'es') list.push('es'); // what is already drawn is Spanish
+        list.push(code);
+        core.set(d, 'languages', list);
+        state.lang = code;
+        languagesChanged('Add UI language');
+    }
+    function removeLanguage(code) {
+        const d = needProject();
+        const old = Array.isArray(d.languages) ? d.languages : [];
+        const list = old.filter((c) => c !== code);
+        if (list.length === old.length) return;
+        if (old[0] === code && list[0]) { // the default language changes: the next one's tooltip texts become the main ones
+            for (const rec of Object.values((d.editor && d.editor.tooltips) || {})) {
+                const nt = rec.texts && rec.texts[list[0]];
+                if (nt) { core.set(rec, 'text', nt); core.del(rec.texts, list[0]); }
+            }
+        }
+        core.set(d, 'languages', list);
+        if (!list.includes(state.lang)) state.lang = list[0] || '';
+        languagesChanged('Remove UI language');
+    }
+
+    // ---- translation table
+    function winLabel(d, g) {
+        for (let x = g; x instanceof Group; x = x.parent) if (x.name === COMUNES) return 'Todas las ventanas';
+        const sc = screenForGroup(d, g);
+        return sc ? nice(sc.id) : '';
+    }
+    // rows: every text piece with a record and every tooltip, with one cell per language
+    function translationItems(d) {
+        const items = [], ed = d.editor || {}, langs = d.languages || [], def = core.defLang(d);
+        for (const bone of Object.keys(ed.texts || {})) {
+            const g = findGroup(bone), rec = ed.texts[bone];
+            if (!g || !rec) continue;
+            const cells = {};
+            for (const c of langs) cells[c] = String((rec.text && rec.text[c]) || '');
+            items.push({ key: 't:' + bone, kind: 'text', bone, win: winLabel(d, g), name: nice(bone), font: rec.font, cells, orig: Object.assign({}, cells) });
+        }
+        for (const bone of Object.keys(ed.tooltips || {})) {
+            const g = findGroup(bone), rec = ed.tooltips[bone], f = core.findBone(d, bone);
+            if (!g || !rec || !f || !f.element || !tipHasText(d, rec)) continue;
+            const map = tipMap(d, rec), cells = {};
+            for (const c of langs) cells[c] = String(map[c] || '');
+            items.push({ key: 'p:' + bone, kind: 'tip', bone, win: nice(f.screen.id), name: 'Ayuda de ' + nice(bone), font: rec.font, cells, orig: Object.assign({}, cells) });
+        }
+        return items;
+    }
+    function applyTranslations(d, items) {
+        const def = core.defLang(d), textB = [], tipB = [];
+        for (const it of items) {
+            if (!Object.keys(it.cells).some((c) => it.cells[c] !== it.orig[c])) continue;
+            if (it.kind === 'text') {
+                const rec = textRec(it.bone);
+                if (!rec) continue;
+                if (!rec.text) core.set(rec, 'text', {});
+                for (const c of Object.keys(it.cells)) core.set(rec.text, c, it.cells[c]);
+                textB.push(it.bone);
+            } else {
+                const rec = tooltipRec(it.bone);
+                if (!rec) continue;
+                for (const c of Object.keys(it.cells)) {
+                    if (c === def) core.set(rec, 'text', it.cells[c]);
+                    else { if (!rec.texts) core.set(rec, 'texts', {}); core.set(rec.texts, c, it.cells[c]); }
+                }
+                tipB.push(it.bone);
+            }
+        }
+        if (!textB.length && !tipB.length) return;
+        touch();
+        const errs = regenMany(textB, tipB, 'Edit UI translations');
+        if (errs.length) Blockbench.showMessageBox({ title: 'Traducciones', message: errs.map(esc).join('<br>'), icon: 'warning' });
+    }
+    function translationsDialog() {
+        const d = needProject();
+        if (!core.isMulti(d)) throw new Error('Añade al menos dos idiomas para traducir.');
+        const items = translationItems(d);
+        if (!items.length) throw new Error('Todavía no hay textos que traducir: añade un «Texto» o escribe el texto al pasar el ratón de un botón.');
+        const def = core.defLang(d), fonts = d.fonts || {};
+        const tr = { rows: items, langs: d.languages.map((c) => ({ code: c, name: core.langName(c) })), def, defName: core.langName(def) };
+        const component = {
+            data() { return { tr }; },
+            computed: {
+                pending() { let n = 0; for (const r of this.tr.rows) for (const l of this.tr.langs) if (!String(r.cells[l.code] || '').trim()) n++; return n; },
+            },
+            methods: {
+                miss(r, code) { const f = fonts[r.font]; return f ? core.missingChars(f, r.cells[code]) : []; },
+                hint(r, code) { return code === this.tr.def ? '(vacío)' : '(se ve en ' + this.tr.defName + ')'; },
+            },
+            template: '<div class="bbui-tr"><div class="bba-dim">Escribe cada texto en cada idioma. Una casilla vacía se ve en ' + esc(core.langName(def)) + '. <b v-if="pending">{{pending}} sin rellenar.</b></div>' +
+                '<div class="bbui-trscroll"><table class="bbui-trtab"><thead><tr><th>Pieza</th><th v-for="l in tr.langs" :key="l.code">{{l.name}}</th></tr></thead><tbody>' +
+                '<tr v-for="r in tr.rows" :key="r.key"><td class="bbui-trname"><small>{{r.win}}</small>{{r.name}}</td>' +
+                '<td v-for="l in tr.langs" :key="l.code"><textarea rows="2" :class="{\'bbui-trempty\': !String(r.cells[l.code] || \'\').trim()}" :placeholder="hint(r, l.code)" v-model="r.cells[l.code]"></textarea>' +
+                '<div v-if="miss(r, l.code).length" class="bbui-trwarn">La letra no tiene: {{miss(r, l.code).join(\' \')}}</div></td></tr></tbody></table></div></div>',
+        };
+        const dlg = new Dialog({
+            id: 'bb_ui_translations', title: 'Traducciones', width: 900, component,
+            buttons: ['Aplicar', 'Cancelar'], confirmIndex: 0, cancelIndex: 1,
+            onConfirm() {
+                try { applyTranslations(d, tr.rows); }
+                catch (e) { Blockbench.showMessageBox({ title: 'Traducciones', message: esc(e.message), icon: 'error' }); return false; }
+            },
+        });
+        dlg.show();
+        return dlg;
     }
 
     // ------------------------------------------------------------------ UI animations (Blockbench Animation <-> role)
@@ -1511,20 +1852,171 @@
         }).show();
     }
 
+    // ------------------------------------------------------------------ piece types (panel / button / image / text / character ...)
+    // Derived from what already exists, stored only when it cannot be derived:
+    //   button = element of type button in a screen; number/model = elements of those types; character = name `personaje_*`;
+    //   decor = listed in screen.bones; image = element of type image or `editor.types[bone] === 'image'`;
+    //   panel / text / (hand-marked) image = editor.types[bone] (editor-only, stripped on export, follows renames).
+    const PIECE_TYPES = {
+        panel: { label: 'Panel', icon: 'dashboard', color: 3 },
+        button: { label: 'Botón', icon: 'smart_button', color: 6 },
+        image: { label: 'Imagen', icon: 'image', color: 5 },
+        text: { label: 'Texto', icon: 'text_fields', color: 2 },
+        character: { label: 'Personaje', icon: 'pets', color: 7 },
+        number: { label: 'Número', icon: 'pin', color: 1 },
+        model: { label: 'Modelo', icon: 'view_in_ar', color: 4 },
+        decor: { label: 'Decoración', icon: 'category', color: 9 },
+        highlight: { label: 'Resaltado', icon: 'highlight', color: 8 },
+        tip: { label: 'Texto emergente', icon: 'chat_bubble_outline', color: 8 },
+    };
+    const MARKABLE = ['panel', 'image', 'text']; // the types kept in editor.types
+    function markStoredType(d, name, type) {
+        const ed = editorData();
+        if (!ed.types) { if (!type) return; core.set(ed, 'types', {}); }
+        if (type) { if (ed.types[name] !== type) core.set(ed.types, name, type); }
+        else if (Object.prototype.hasOwnProperty.call(ed.types, name)) core.del(ed.types, name);
+    }
+    // bone name -> type for every bone the data knows about (not window specific). Names that do not exist are simply never looked up.
+    function derivedTypes(d) {
+        const t = {};
+        const stored = (d.editor && d.editor.types) || {};
+        for (const s of d.screens || []) {
+            for (const b of s.bones || []) t[b] = 'decor';
+            for (const e of s.elements || []) {
+                t[e.bone] = e.type === 'image' && stored[e.bone] === 'text' ? 'text' : e.type;
+                if (e.highlight) t[e.highlight] = 'highlight';
+            }
+        }
+        for (const k of Object.keys(stored)) if (MARKABLE.includes(stored[k]) && (!t[k] || t[k] === 'decor')) t[k] = stored[k];
+        return t;
+    }
+    // type of a bone by name, '' when it has none
+    function typeOfName(types, name) {
+        const t = types[name];
+        if (/^personaje_/.test(name) && t !== 'button') return 'character';
+        return t || '';
+    }
+    // The screen a group belongs to when it becomes a button: its window folder, else the screen listing it (or an ancestor), else the active one.
+    function screenForGroup(d, g) {
+        const chain = [];
+        for (let x = g; x instanceof Group; x = x.parent) chain.push(x.name);
+        for (const x of chain) if (/^ventana_/.test(x)) { const s = d.screens.find((sc) => (sc.bones || []).includes(x)); if (s) return s; }
+        const hit = d.screens.filter((s) => chain.some((n) => (s.bones || []).includes(n) || (s.elements || []).some((e) => e.bone === n)));
+        if (hit.length) return hit.find((s) => s.id === state.activeScreen) || hit[0];
+        return core.getScreen(d, state.activeScreen);
+    }
+    const insideFolder = (g) => { for (let x = g.parent; x instanceof Group; x = x.parent) if (isFolderGroup(x)) return true; return false; };
+    // kind: panel | button | image | text | decor (= no type)
+    function setPieceType(name, kind) {
+        const d = needProject();
+        const g = findGroup(name);
+        if (!g) return;
+        if (isFolderGroup(g)) throw new Error('«' + nice(name) + '» es una ventana, no una pieza.');
+        if (/^personaje_/.test(name)) throw new Error('Los personajes se añaden con «Personaje»; no cambian de tipo.');
+        if (d.screens.some((s) => (s.elements || []).some((e) => e.highlight === name))) throw new Error('«' + nice(name) + '» es el resaltado de un botón.');
+        const f = core.findBone(d, name), el = f && f.element;
+        if (el && el.type !== 'button' && el.type !== 'image') throw new Error('Esta pieza es de tipo «' + el.type + '»: cámbiala en Modo programador.');
+        if (kind === 'button') {
+            if (!(el && el.type === 'button')) {
+                if (g.parent instanceof Group && g.parent.name === COMUNES) throw new Error('Un botón debe estar en su ventana: usa «Poner solo en esta ventana».');
+                const scr = screenForGroup(d, g);
+                if (!scr) throw new Error('No hay ventana donde poner el botón.');
+                core.assignBone(d, scr.id, name, 'button', []);
+                markStoredType(d, name, null);
+            }
+        } else {
+            const keepImageEl = !!el && el.type === 'image' && kind === 'image';
+            if (el && !keepImageEl) {
+                core.removeBone(d, name);
+                // no window folder to hold it: keep the piece listed in its window instead of letting it float over every window
+                if (!insideFolder(g) && f.screen) core.assignBone(d, f.screen.id, name, 'decor');
+            }
+            markStoredType(d, name, MARKABLE.includes(kind) && !keepImageEl ? kind : null);
+        }
+        touch(); applyVisibility(); applyRoleColors(); syncState();
+    }
+    // The type a piece shows as in the marking menu (decor = none for anything not markable)
+    function markedKind(name) {
+        const d = getData();
+        if (!d) return 'decor';
+        const t = typeOfName(derivedTypes(d), name);
+        return ['panel', 'button', 'image', 'text', 'character'].includes(t) ? t : 'decor';
+    }
+
+    // Tree of the pieces of one window: typed groups (derived or stored) nested under their nearest typed ancestor; untyped
+    // groups and cubes are skipped. Visibility is the one of applyVisibility (a group listed only in other windows hides its subtree).
+    // -> { roots: [row], parentOf: {name: parentName}, names: Set, types: {name: type}, btn: {name: button of a highlight/tip row} }
+    function buildPieceTree(d, activeId) {
+        const out = { roots: [], parentOf: {}, names: new Set(), types: {}, btn: {} };
+        const scr = d && core.getScreen(d, activeId);
+        if (!scr) return out;
+        const types = derivedTypes(d);
+        const owner = {};
+        const add = (b, id) => { (owner[b] = owner[b] || new Set()).add(id); };
+        for (const s of d.screens) {
+            for (const b of s.bones || []) add(b, s.id);
+            for (const e of s.elements || []) { add(e.bone, s.id); if (e.highlight) add(e.highlight, s.id); }
+        }
+        const hlOf = {}, tipOf = new Map();
+        for (const e of scr.elements || []) {
+            if (e.highlight) hlOf[e.highlight] = e.bone;
+            const tg = e.type === 'button' ? findTipGroup(e.bone) : null;
+            if (tg) tipOf.set(tg, e);
+        }
+        const artist = !state.dev && !state.showAll;
+        const rows = {};
+        const walk = (nodes, parentRow) => {
+            for (const g of nodes || []) {
+                if (!(g instanceof Group)) continue;
+                const o = owner[g.name];
+                if (!state.showAll && o && !o.has(activeId)) continue;
+                if (artist && g.export === false) continue;
+                let type = '';
+                if (tipOf.has(g)) type = 'tip';
+                else if (hlOf[g.name]) type = 'highlight';
+                else if (!isFolderGroup(g)) {
+                    type = typeOfName(types, g.name);
+                    if (type === 'highlight') type = ''; // highlight of an element of another window
+                    if (!type && g.parent instanceof Group && isFolderGroup(g.parent) && subtreeCubes(g).length) type = 'decor';
+                }
+                let row = parentRow;
+                if (type) {
+                    row = { name: g.name, type, kids: [] };
+                    rows[g.name] = row;
+                    (parentRow ? parentRow.kids : out.roots).push(row);
+                    out.parentOf[g.name] = parentRow ? parentRow.name : '';
+                    out.names.add(g.name);
+                    out.types[g.name] = type;
+                }
+                walk(g.children, row);
+            }
+        };
+        walk(Outliner.root, null);
+        // highlights hang from their button, tooltips from their highlight (or the button)
+        const move = (row, target) => {
+            if (!row || !target || row === target) return;
+            for (let x = target.name; x; x = out.parentOf[x]) if (x === row.name) return; // never under its own descendant
+            const list = out.parentOf[row.name] ? rows[out.parentOf[row.name]].kids : out.roots;
+            const i = list.indexOf(row);
+            if (i >= 0) list.splice(i, 1);
+            target.kids.push(row);
+            out.parentOf[row.name] = target.name;
+        };
+        for (const nm of Object.keys(hlOf)) if (rows[nm]) { out.btn[nm] = hlOf[nm]; move(rows[nm], rows[hlOf[nm]]); }
+        for (const [g, e] of tipOf) if (rows[g.name]) { out.btn[g.name] = e.bone; move(rows[g.name], rows[e.highlight] || rows[e.bone]); }
+        return out;
+    }
+
     // ------------------------------------------------------------------ role colours (outliner)
-    const ROLE_COLOR = { button: 6, image: 5, number: 1, model: 4, decor: 9, highlight: 8 };
     let colorSig = '';
     function applyRoleColors() {
         const d = getData();
         if (!d) return;
-        const role = {};
-        for (const s of d.screens || []) {
-            for (const b of s.bones || []) role[b] = 'decor';
-            for (const e of s.elements || []) { role[e.bone] = e.type; if (e.highlight) role[e.highlight] = 'highlight'; }
-        }
+        const types = derivedTypes(d);
         for (const g of Group.all || []) {
-            const r = role[g.name];
-            if (r) { const c = ROLE_COLOR[r]; if (g.color !== c) g.color = c; g.bbui_colored = true; }
+            const r = typeOfName(types, g.name);
+            const info = r && PIECE_TYPES[r];
+            if (info) { if (g.color !== info.color) g.color = info.color; g.bbui_colored = true; }
             else if (g.bbui_colored) { g.color = 0; g.bbui_colored = false; }
         }
     }
@@ -1705,6 +2197,12 @@
         const ui = clone(d);
         delete ui.fonts;
         delete ui.editor;
+        { // languages: the filter errors on translations of bones that no longer exist, and ignores them with a single language
+            const nTr = Object.keys(ui.translations || {}).length;
+            core.cleanLanguages(ui, (geos[0].bones || []).map((b) => b.name));
+            const left = Object.keys(ui.translations || {}).length;
+            if (nTr > left && core.isMulti(ui)) res.warnings.push('Se quitaron ' + (nTr - left) + ' marca(s) de idioma de piezas que ya no existen.');
+        }
         fs.writeFileSync(dir + '/ui.json', JSON.stringify(ui, null, 2));
 
         // Bedrock animations (same codec as File > Export > Bedrock animations), only when the project has some
@@ -2061,15 +2559,6 @@
 
     // ------------------------------------------------------------------ pieces (decoration / button / common)
     function pieceScreen() { const d = getData(); return d ? core.getScreen(d, state.activeScreen) : null; }
-    function setPieceKind(name, kind) {
-        const d = needProject(), scr = pieceScreen();
-        if (!scr || !name) return;
-        const f = core.findBone(d, name);
-        const isBtn = !!(f && f.element && f.element.type === 'button');
-        if (kind === 'button' && !isBtn) core.assignBone(d, scr.id, name, 'button', []);
-        else if (kind === 'decor' && isBtn) core.removeBone(d, name); // decoration = just part of the window folder
-        touch(); applyRoleColors(); syncState();
-    }
     function setPieceTarget(name, value) {
         const scr = pieceScreen();
         const el = scr && (scr.elements || []).find((e) => e.bone === name && e.type === 'button');
@@ -2751,6 +3240,16 @@
         <div v-for="x in report.extras" :key="x.name" class="bbui-warn">{{x.name}}: {{x.msg}}</div></div></div>`;
 
     const TPL_ARTIST = `<div class="bbui bbui-artist" v-if="st.data">
+        <div class="bba-sec"><i class="material-icons">translate</i><span>Idioma</span></div>
+        <div v-if="langs.length" class="bba-chips">
+        <button v-for="c in langs" :key="c" class="bba-chip" :class="{on: c === editCode}" :title="'Ver y escribir en ' + langName(c)" @click="pickLang(c)">{{langName(c)}}<i v-if="multi && c === defCode" class="material-icons" title="Idioma principal: se usa cuando falta una traducción">star</i></button></div>
+        <div v-if="multi" class="bba-dim">Escribes en «{{langName(editCode)}}». Lo que falte por traducir se ve en {{langName(defCode)}}.</div>
+        <div v-else class="bba-dim">Añade un idioma para traducir los textos y verlos aquí mismo.</div>
+        <div class="bba-line"><select class="bba-full" @change="addLang($event)"><option value="">Añadir idioma…</option><option v-for="l in addable" :key="l[0]" :value="l[0]">{{l[1]}}</option></select></div>
+        <div v-if="langs.length" class="bba-line">
+        <button v-if="multi" class="bba-btn bba-half" title="Todos los textos en una tabla" @click="openTr"><i class="material-icons">table_chart</i> Traducciones</button>
+        <button class="bba-btn bba-half bba-danger" :title="'Quitar ' + langName(editCode) + ' del proyecto'" @click="dropLang(editCode)"><i class="material-icons">remove_circle_outline</i> Quitar</button></div>
+
         <div class="bba-sec"><i class="material-icons">web_stories</i><span>Ventanas</span></div>
         <div class="bbui-wlist"><div v-for="s in st.data.screens" :key="s.id" class="bbui-win" :class="{active: s.id === st.activeScreen}" title="Clic: ver y editar esta ventana" @click="activate(s.id)">
         <button class="bbui-ib bbui-star" :class="{on: s.id === st.data.start_screen}" :title="s.id === st.data.start_screen ? 'Es la ventana con la que empieza' : 'Hacer que el juego empiece por esta ventana'" @click.stop="setStart(s.id)"><i class="material-icons">{{s.id === st.data.start_screen ? 'star' : 'star_border'}}</i></button>
@@ -2758,6 +3257,14 @@
         <button class="bbui-ib bba-hov" title="Cambiar el nombre" @click.stop="rename(s.id)"><i class="material-icons">edit</i></button>
         <button class="bbui-ib bba-hov" title="Borrar la ventana" @click.stop="remove(s.id)"><i class="material-icons">delete_outline</i></button></div></div>
         <button class="bba-add" @click="addWindow"><i class="material-icons">add</i> Nueva ventana</button>
+
+        <div class="bba-sec"><i class="material-icons">account_tree</i><span>Piezas</span></div>
+        <div v-if="!pieceRows.length" class="bba-dim">Esta ventana todavía no tiene piezas.</div>
+        <div v-else class="bba-plist">
+        <div v-for="(r, i) in pieceRows" :key="r.name + '#' + i" class="bba-prow" :class="{active: r.name === activeName}" :style="{paddingLeft: (2 + r.depth * 14) + 'px'}" :title="r.name" @click="pickPiece(r.name)">
+        <span class="bba-arrow" @click.stop="r.kids ? toggleRow(r) : 0"><i v-if="r.kids" class="material-icons">{{r.open ? 'expand_more' : 'chevron_right'}}</i></span>
+        <i class="material-icons bba-pico" :class="'bba-t-' + r.type">{{r.icon}}</i>
+        <span class="bbui-wname">{{r.label}}</span><span v-if="r.lang" class="bba-badge" :title="'Solo se ve en ' + langName(r.lang)">{{r.lang.toUpperCase()}}</span></div></div>
 
         <div class="bba-sec"><i class="material-icons">ads_click</i><span>Seleccionado</span></div>
         <div v-if="!piece" class="bba-empty"><i class="material-icons">touch_app</i><div>Haz clic en algo de la vista para editarlo</div></div>
@@ -2768,17 +3275,41 @@
         <div class="bba-dim">1 = tal cual · 0.5 = la mitad · 2 = el doble</div>
         <button class="bba-btn bba-danger" @click="removeChar"><i class="material-icons">delete_outline</i> Quitar personaje</button></div>
         <div v-else class="bba-card">
-        <div class="bba-title"><i class="material-icons">{{isButton ? 'smart_button' : 'category'}}</i>{{pieceNice}}</div>
+        <div class="bba-title"><i class="material-icons">{{pieceIcon}}</i>{{pieceNice}}</div>
         <div v-if="isCommon" class="bba-dim">Está en todas las ventanas.</div>
-        <div v-else class="bba-seg">
-        <button :class="{on: !isButton}" @click="setKind('decor')">Decoración</button>
-        <button :class="{on: isButton}" @click="setKind('button')">Botón</button></div>
+        <div v-if="canMark" class="bba-seg bba-seg5">
+        <button v-for="k in kindList" :key="k.k" :class="{on: pieceType === k.k}" :disabled="k.k === 'button' && isCommon" :title="'Marcar como: ' + k.t" @click="setKind(k.k)">{{k.t}}</button></div>
+        <div v-else class="bba-dim">Tipo: {{pieceTypeLabel}}</div>
+        <template v-if="isTextPiece">
+        <template v-if="textRec">
+        <div class="bba-lbl">Texto<span v-if="multi"> en {{langName(editCode)}}</span></div>
+        <textarea class="bba-full bba-ta" rows="2" :placeholder="textHint" :value="textValue" @input="setTextValue($event.target.value)"></textarea>
+        <div v-if="multi && !textValue.trim()" class="bba-dim bba-warn">Sin traducir: se ve en {{langName(defCode)}}.</div>
+        <div v-if="textMissing.length" class="bba-dim bba-warn">La letra no tiene: {{textMissing.join(' ')}}</div>
+        <button v-if="multi" class="bba-link" @click="showAllLangs = !showAllLangs"><i class="material-icons">{{showAllLangs ? 'expand_less' : 'expand_more'}}</i> ver todos los idiomas</button>
+        <div v-if="multi && showAllLangs"><div v-for="x in textAll" :key="x.code" class="bba-line"><span class="bba-lc" :class="{bad: !x.value.trim()}">{{x.code.toUpperCase()}}</span><input type="text" :value="x.value" :placeholder="x.code === defCode ? '' : '(sin traducir)'" @input="setTextLang(x.code, $event.target.value)"></div></div>
+        <button class="bba-link" @click="moreText = !moreText"><i class="material-icons">{{moreText ? 'expand_less' : 'expand_more'}}</i> más opciones</button>
+        <template v-if="moreText">
+        <div class="bba-line"><select v-if="fontNames.length > 1" title="Letra" @change="setTextOpt('font', $event.target.value)"><option v-for="f in fontNames" :value="f" :selected="f === textRec.font">{{f}}</option></select>
+        <input type="number" min="0.05" step="0.05" title="Tamaño de la letra" :value="textRec.scale" @change="setTextOpt('scale', Number($event.target.value))"></div>
+        <div class="bba-seg bba-seg4"><button v-for="a in aligns" :key="a.k" :class="{on: textRec.align === a.k}" :title="a.t" @click="setTextOpt('align', a.k)"><i class="material-icons">{{a.i}}</i></button></div>
+        </template>
+        </template>
+        <div v-else class="bba-dim">Este texto está dibujado como una imagen. Para verlo en otro idioma, haz una copia y elige su idioma aquí abajo.</div>
+        </template>
+        <template v-if="multi && !(isTextPiece && textRec)">
+        <div class="bba-lbl">Idioma de esta pieza</div>
+        <select class="bba-full" @change="setPieceLang($event.target.value)"><option value="" :selected="!pieceLang">Todos</option><option v-for="c in langs" :key="c" :value="c" :selected="c === pieceLang">{{langName(c)}}</option></select>
+        <div v-if="pieceLang" class="bba-dim">Solo se ve en {{langName(pieceLang)}}.</div>
+        </template>
         <template v-if="isButton">
         <div class="bba-lbl">Al pulsar va a</div>
         <select class="bba-full" @change="setTarget($event.target.value)"><option v-for="o in targetOptions" :value="o.v" :selected="o.v === targetValue">{{o.t}}</option></select>
-        <div class="bba-lbl">Texto al pasar el ratón</div>
-        <input class="bba-full" type="text" placeholder="Por ejemplo: Siguiente página" :value="tipText" @input="setTipText($event.target.value)">
-        <template v-if="tipText">
+        <div class="bba-lbl">Texto al pasar el ratón<span v-if="multi"> en {{langName(editCode)}}</span></div>
+        <input class="bba-full" type="text" :placeholder="tipHint" :value="tipText" @input="setTipText($event.target.value)">
+        <div v-if="multi && tipHas && !tipText.trim()" class="bba-dim bba-warn">Sin traducir: se ve en {{langName(defCode)}}.</div>
+        <div v-if="tipMissing.length" class="bba-dim bba-warn">La letra no tiene: {{tipMissing.join(' ')}}</div>
+        <template v-if="tipHas">
         <div class="bba-line bba-tipopts">
         <div class="bba-seg bba-seg4">
         <button v-for="sd in tipSides" :key="sd.k" :class="{on: tipSide === sd.k}" :title="sd.t" @click="setTipSide(sd.k)"><i class="material-icons">{{sd.i}}</i></button></div>
@@ -2788,7 +3319,7 @@
         <div v-if="hasOldTip" class="bba-dim">Este botón ya trae un texto dibujado a mano; el que escribas se añade aparte.</div>
         </template>
         <button v-if="isCommon" class="bba-btn" @click="toWindow">Poner solo en esta ventana</button>
-        <button v-else-if="!isButton" class="bba-btn" @click="toCommon">Poner en todas las ventanas</button></div>
+        <button v-else-if="!isButton && isTop" class="bba-btn" @click="toCommon">Poner en todas las ventanas</button></div>
 
         <div class="bba-sec"><i class="material-icons">animation</i><span>Transición al entrar</span></div>
         <select class="bba-full" @change="setTrans($event.target.value)"><option v-for="(t, k) in transitions" :value="k" :selected="k === transValue">{{t}}</option></select>
@@ -2822,21 +3353,72 @@
             component: {
                 data() {
                     return {
-                        st: state, scaleBy: 1, transitions: TRANSITIONS,
+                        st: state, scaleBy: 1, transitions: TRANSITIONS, open: {}, showAllLangs: false, moreText: false,
+                        aligns: [{ k: 'left', i: 'format_align_left', t: 'A la izquierda' }, { k: 'center', i: 'format_align_center', t: 'Centrado' }, { k: 'right', i: 'format_align_right', t: 'A la derecha' }],
+                        kindList: [{ k: 'panel', t: 'Panel' }, { k: 'image', t: 'Imagen' }, { k: 'text', t: 'Texto' }, { k: 'button', t: 'Botón' }, { k: 'decor', t: 'Otro' }],
                         tipSides: [{ k: 'izquierda', i: 'west', t: 'A la izquierda' }, { k: 'arriba', i: 'north', t: 'Arriba' }, { k: 'abajo', i: 'south', t: 'Abajo' }, { k: 'derecha', i: 'east', t: 'A la derecha' }],
                     };
                 },
                 computed: {
                     screen() { return this.st.data ? core.getScreen(this.st.data, this.st.activeScreen) : null; },
-                    piece() { void this.st.groups; return this.st.piece && findGroup(this.st.piece) ? this.st.piece : ''; },
+                    // pieces of the active window as a tree (see buildPieceTree); recomputed on data/structure changes, not per render
+                    tree() { void this.st.rev; void this.st.groups; void this.st.activeScreen; void this.st.dev; void this.st.showAll; try { return buildPieceTree(this.st.data, this.st.activeScreen); } catch (e) { console.warn('BB UI Builder: pieces', e); return { roots: [], parentOf: {}, names: new Set(), types: {}, btn: {} }; } },
+                    // the row that stands for the selection: the group itself, else its nearest ancestor that is a row
+                    activeName() {
+                        const t = this.tree;
+                        if (t.names.has(this.st.grp)) return this.st.grp;
+                        for (let g = findGroup(this.st.grp); g instanceof Group; g = g.parent) if (t.names.has(g.name)) return g.name;
+                        return t.names.has(this.st.piece) ? this.st.piece : '';
+                    },
+                    pieceRows() {
+                        const out = [], open = this.open, multi = this.multi, trs = (this.st.data && this.st.data.translations) || {};
+                        const rec = (list, depth) => {
+                            for (const r of list) {
+                                const t = PIECE_TYPES[r.type] || PIECE_TYPES.decor;
+                                const isOpen = open[r.name] !== undefined ? open[r.name] : depth === 0;
+                                const label = r.type === 'highlight' || r.type === 'tip' ? t.label : nice(r.type === 'character' ? r.name.replace(/^personaje_/, '') : r.name);
+                                out.push({ name: r.name, type: r.type, icon: t.icon, label, depth, kids: r.kids.length, open: isOpen, lang: multi && trs[r.name] && this.langs.includes(trs[r.name]) ? trs[r.name] : '' });
+                                if (r.kids.length && isOpen) rec(r.kids, depth + 1);
+                            }
+                        };
+                        rec(this.tree.roots, 0);
+                        return out;
+                    },
+                    // what the Seleccionado card edits: the selected row (a highlight / tooltip stands for its button), else the window piece
+                    piece() {
+                        void this.st.groups;
+                        let n = this.activeName || this.st.piece;
+                        if (n && this.tree.btn[n]) n = this.tree.btn[n];
+                        return n && findGroup(n) ? n : '';
+                    },
                     pieceGroup() { void this.st.rev; return this.piece ? findGroup(this.piece) : null; },
+                    isTop() { const g = this.pieceGroup; return !!g && g.parent instanceof Group && isFolderGroup(g.parent); },
+                    pieceType() { const t = this.tree.types[this.piece] || ''; return ['panel', 'button', 'image', 'text'].includes(t) ? t : 'decor'; },
+                    canMark() { const t = this.tree.types[this.piece] || ''; return !!this.piece && !this.isChar && t !== 'number' && t !== 'model'; },
+                    pieceTypeLabel() { return (PIECE_TYPES[this.tree.types[this.piece]] || PIECE_TYPES.decor).label; },
+                    pieceIcon() { return (PIECE_TYPES[this.isChar ? 'character' : this.pieceType] || PIECE_TYPES.decor).icon; },
                     isCommon() { void this.st.rev; const g = this.pieceGroup; return !!g && g.parent instanceof Group && g.parent.name === COMUNES; },
                     isChar() { return /^personaje_/.test(this.piece); },
                     pieceNice() { return nice(this.piece.replace(/^personaje_/, '')); },
                     el() { const s = this.screen; return s && this.piece ? ((s.elements || []).find((e) => e.bone === this.piece && e.type === 'button') || null) : null; },
                     isButton() { return !!this.el; },
                     tipRec() { void this.st.rev; const ed = this.st.data && this.st.data.editor; return (ed && ed.tooltips && this.piece && ed.tooltips[this.piece]) || null; },
-                    tipText() { return this.tipRec ? this.tipRec.text || '' : ''; },
+                    langs() { void this.st.rev; const l = this.st.data && this.st.data.languages; return Array.isArray(l) ? l.slice() : []; },
+                    multi() { return this.langs.length > 1; },
+                    defCode() { return this.langs[0] || 'es'; },
+                    editCode() { return this.langs.includes(this.st.lang) ? this.st.lang : this.defCode; },
+                    addable() { return core.LANGS.filter((l) => !this.langs.includes(l[0])); },
+                    pieceLang() { void this.st.rev; const t = this.st.data && this.st.data.translations; return (t && this.piece && t[this.piece]) || ''; },
+                    isTextPiece() { return this.pieceType === 'text'; },
+                    textRec() { void this.st.rev; const ed = this.st.data && this.st.data.editor; return (ed && ed.texts && this.piece && ed.texts[this.piece]) || null; },
+                    textValue() { const r = this.textRec; return r && r.text ? String(r.text[this.editCode] || '') : ''; },
+                    textHint() { const r = this.textRec; return this.multi && r && r.text && this.editCode !== this.defCode && r.text[this.defCode] ? String(r.text[this.defCode]) : 'Escribe el texto'; },
+                    textAll() { const r = this.textRec; return this.langs.map((c) => ({ code: c, value: r && r.text ? String(r.text[c] || '') : '' })); },
+                    textMissing() { const r = this.textRec, f = r && this.st.data.fonts && this.st.data.fonts[r.font]; return f ? core.missingChars(f, this.textValue) : []; },
+                    tipText() { const r = this.tipRec; if (!r) return ''; return this.multi && this.editCode !== this.defCode ? String((r.texts && r.texts[this.editCode]) || '') : String(r.text || ''); },
+                    tipHas() { const r = this.tipRec; return !!r && (!!String(r.text || '').trim() || (this.multi && Object.values(r.texts || {}).some((v) => String(v || '').trim()))); },
+                    tipHint() { const r = this.tipRec; return this.multi && this.editCode !== this.defCode && r && r.text ? String(r.text) : 'Por ejemplo: Siguiente página'; },
+                    tipMissing() { const r = this.tipRec, f = r && this.st.data.fonts && this.st.data.fonts[r.font]; return f ? core.missingChars(f, this.tipText) : []; },
                     tipSide() { return this.tipRec ? this.tipRec.side || 'derecha' : 'derecha'; },
                     tipFont() { return this.tipRec ? this.tipRec.font || '' : ''; },
                     tipHasBg() { return !!(this.tipRec && Array.isArray(this.tipRec.bg)); },
@@ -2869,9 +3451,25 @@
                         return TRANSITIONS[rec] && rec !== 'none' ? rec : 'custom';
                     },
                 },
+                watch: {
+                    // a selection made in the viewport opens the rows above it
+                    activeName(n) { for (let p = n && this.tree.parentOf[n]; p; p = this.tree.parentOf[p]) if (this.open[p] !== true) this.$set(this.open, p, true); },
+                },
                 methods: {
                     nice,
+                    langName: core.langName,
                     guard(fn) { try { fn(); } catch (e) { console.error(e); Blockbench.showQuickMessage(e.message, 3000); } },
+                    pickLang(c) { setLang(c); },
+                    addLang(ev) { const v = ev.target.value; ev.target.value = ''; if (v) this.guard(() => addLanguage(v)); },
+                    dropLang(c) {
+                        if (!c) return;
+                        Blockbench.showMessageBox({ title: 'Quitar idioma', message: 'Quitar «' + esc(core.langName(c)) + '» del proyecto? Sus textos y las piezas solo de ese idioma se dejan de usar.', buttons: ['Quitar', 'Cancelar'], confirm: 0, cancel: 1 }, (i) => { if (i === 0) this.guard(() => removeLanguage(c)); });
+                    },
+                    openTr() { this.guard(translationsDialog); },
+                    setPieceLang(v) { this.guard(() => setPieceLang(this.piece, v)); },
+                    setTextValue(v) { this.guard(() => setTextPiece(this.piece, { text: v })); },
+                    setTextLang(code, v) { this.guard(() => setTextPiece(this.piece, { text: v, lang: code })); },
+                    setTextOpt(k, v) { this.guard(() => setTextPiece(this.piece, { [k]: v }, true)); },
                     activate(id) { gotoScreen(id); applyGameView(true); },
                     setStart(id) { this.st.data.start_screen = id; touch(); },
                     addWindow() {
@@ -2882,12 +3480,15 @@
                         if (this.st.data.screens.length < 2) return Blockbench.showQuickMessage('Debe quedar al menos una ventana', 2000);
                         Blockbench.showMessageBox({ title: 'Borrar ventana', message: 'Borrar la ventana "' + esc(nice(id)) + '" con todo lo que tiene dentro?', buttons: ['Borrar', 'Cancelar'], confirm: 0, cancel: 1 }, (i) => { if (i === 0) this.guard(() => deleteWindow(id)); });
                     },
-                    setKind(k) { this.guard(() => setPieceKind(this.piece, k)); },
+                    setKind(k) { this.guard(() => setPieceType(this.piece, k)); },
+                    pickPiece(name) { const g = findGroup(name); if (g) { selectGroup(g); syncState(); } },
+                    toggleRow(r) { this.$set(this.open, r.name, !r.open); },
                     setTarget(v) { this.guard(() => setPieceTarget(this.piece, v)); },
                     setTipText(v) {
                         this.guard(() => {
                             const rec = tooltipRec(this.piece);
-                            const patch = { text: v };
+                            // the default language lives in rec.text, the others in rec.texts[code]
+                            const patch = this.multi && this.editCode !== this.defCode ? { texts: Object.assign({}, rec && rec.texts, { [this.editCode]: v }) } : { text: v };
                             // first text: pick a light font if there is one (most UI fonts are white/negative)
                             if (!rec || !rec.font) { const f = this.fontNames.find((n) => /whit|withe|blanc|ui_font/i.test(n)) || this.fontNames[0]; if (f) patch.font = f; }
                             // first text: same background as the project's other tooltips, so it reads on any page
@@ -3193,7 +3794,9 @@
         }));
     }
 
-    const CSS = '.bba-sec{display:flex;align-items:center;gap:6px;margin:14px 0 6px;padding-bottom:4px;border-bottom:1px solid var(--color-border);font-size:11px;font-weight:bold;letter-spacing:.06em;text-transform:uppercase;color:var(--color-subtle_text)}.bba-sec:first-child{margin-top:4px}.bba-sec i{font-size:16px}.bba-add{width:100%;margin:6px 0 2px;padding:6px;border:1px dashed var(--color-border);background:transparent;border-radius:6px;display:flex;align-items:center;justify-content:center;gap:4px;cursor:pointer;color:var(--color-subtle_text)}.bba-add:hover{border-color:var(--color-accent);color:var(--color-text)}.bba-add i{font-size:16px}.bbui-win .bba-hov{opacity:0}.bbui-win:hover .bba-hov,.bbui-win.active .bba-hov{opacity:.75}.bbui-star.on i{color:#f5c542}.bba-empty{display:flex;flex-direction:column;align-items:center;gap:4px;padding:12px 8px;border:1px dashed var(--color-border);border-radius:6px;color:var(--color-subtle_text);text-align:center;font-size:12px}.bba-empty i{font-size:22px;opacity:.7}.bba-card{border:1px solid var(--color-border);border-radius:6px;padding:10px;background:var(--color-back)}.bba-title{display:flex;align-items:center;gap:6px;font-size:14px;font-weight:bold;margin-bottom:8px}.bba-title i{font-size:18px;opacity:.8}.bba-lbl{font-size:12px;color:var(--color-subtle_text);margin:10px 0 3px}.bba-full{width:100%;box-sizing:border-box;height:30px}.bba-dim{font-size:11px;color:var(--color-subtle_text);margin-top:4px}.bba-seg{display:flex;border:1px solid var(--color-border);border-radius:6px;overflow:hidden}.bba-seg button{flex:1;padding:6px 4px;border:none;border-radius:0;background:transparent;cursor:pointer;min-width:0}.bba-seg button+button{border-left:1px solid var(--color-border)}.bba-seg button.on{background:var(--color-accent);color:var(--color-accent_text,#fff)}.bba-seg4{flex:0 0 auto}.bba-seg4 button{padding:4px 6px}.bba-seg4 i{font-size:16px}.bba-line{display:flex;gap:6px;align-items:center;margin-top:6px}.bba-line input{flex:1;min-width:0}.bba-tipopts select{flex:1;min-width:0;height:28px}.bba-link{margin-top:6px;padding:2px 0;border:none;background:transparent;cursor:pointer;color:var(--color-subtle_text);display:flex;align-items:center;gap:4px;font-size:12px}.bba-link:hover{color:var(--color-text)}.bba-link i{font-size:15px}.bba-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}.bba-tile{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;cursor:pointer;min-width:0;font-size:13px}.bba-tile i{font-size:20px;opacity:.85}.bba-btn{width:100%;margin-top:6px;padding:7px;border-radius:6px;display:flex;align-items:center;justify-content:center;gap:6px;cursor:pointer;font-size:13px}.bba-btn i{font-size:18px}.bba-btn.on{background:var(--color-selected)}.bba-primary{background:var(--color-accent);color:var(--color-accent_text,#fff);font-weight:bold;padding:9px}.bba-primary:hover{filter:brightness(1.1)}.bba-primary:disabled{opacity:.6}.bba-danger:hover{color:#ff6b6b}.bba-dev{display:flex;align-items:center;gap:6px;margin:18px 0 4px;padding-top:8px;border-top:1px solid var(--color-border);font-size:12px;color:var(--color-subtle_text)}' +
+    const CSS = '.bba-sec{display:flex;align-items:center;gap:6px;margin:14px 0 6px;padding-bottom:4px;border-bottom:1px solid var(--color-border);font-size:11px;font-weight:bold;letter-spacing:.06em;text-transform:uppercase;color:var(--color-subtle_text)}.bba-sec:first-child{margin-top:4px}.bba-sec i{font-size:16px}.bba-add{width:100%;margin:6px 0 2px;padding:6px;border:1px dashed var(--color-border);background:transparent;border-radius:6px;display:flex;align-items:center;justify-content:center;gap:4px;cursor:pointer;color:var(--color-subtle_text)}.bba-add:hover{border-color:var(--color-accent);color:var(--color-text)}.bba-add i{font-size:16px}.bbui-win .bba-hov{opacity:0}.bbui-win:hover .bba-hov,.bbui-win.active .bba-hov{opacity:.75}.bbui-star.on i{color:#f5c542}.bba-empty{display:flex;flex-direction:column;align-items:center;gap:4px;padding:12px 8px;border:1px dashed var(--color-border);border-radius:6px;color:var(--color-subtle_text);text-align:center;font-size:12px}.bba-empty i{font-size:22px;opacity:.7}.bba-card{border:1px solid var(--color-border);border-radius:6px;padding:10px;background:var(--color-back)}.bba-title{display:flex;align-items:center;gap:6px;font-size:14px;font-weight:bold;margin-bottom:8px}.bba-title i{font-size:18px;opacity:.8}.bba-lbl{font-size:12px;color:var(--color-subtle_text);margin:10px 0 3px}.bba-full{width:100%;box-sizing:border-box;height:30px}.bba-dim{font-size:11px;color:var(--color-subtle_text);margin-top:4px}.bba-seg{display:flex;border:1px solid var(--color-border);border-radius:6px;overflow:hidden}.bba-seg button{flex:1;padding:6px 4px;border:none;border-radius:0;background:transparent;cursor:pointer;min-width:0}.bba-seg button+button{border-left:1px solid var(--color-border)}.bba-seg button.on{background:var(--color-accent);color:var(--color-accent_text,#fff)}.bba-seg4{flex:0 0 auto}.bba-seg4 button{padding:4px 6px}.bba-seg4 i{font-size:16px}.bba-line{display:flex;gap:6px;align-items:center;margin-top:6px}.bba-line input{flex:1;min-width:0}.bba-tipopts select{flex:1;min-width:0;height:28px}.bba-link{margin-top:6px;padding:2px 0;border:none;background:transparent;cursor:pointer;color:var(--color-subtle_text);display:flex;align-items:center;gap:4px;font-size:12px}.bba-link:hover{color:var(--color-text)}.bba-link i{font-size:15px}.bba-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}.bba-tile{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;cursor:pointer;min-width:0;font-size:13px}.bba-tile i{font-size:20px;opacity:.85}.bba-btn{width:100%;margin-top:6px;padding:7px;border-radius:6px;display:flex;align-items:center;justify-content:center;gap:6px;cursor:pointer;font-size:13px}.bba-btn i{font-size:18px}.bba-btn.on{background:var(--color-selected)}.bba-primary{background:var(--color-accent);color:var(--color-accent_text,#fff);font-weight:bold;padding:9px}.bba-primary:hover{filter:brightness(1.1)}.bba-primary:disabled{opacity:.6}.bba-danger:hover{color:#ff6b6b}.bba-seg5 button{font-size:11px;padding:6px 2px}.bba-seg button:disabled{opacity:.4;cursor:default}.bba-plist{max-height:260px;overflow-y:auto;border:1px solid var(--color-border);border-radius:6px;padding:2px 0;background:var(--color-back)}.bba-prow{display:flex;align-items:center;gap:4px;padding:3px 6px 3px 2px;cursor:pointer;font-size:13px}.bba-prow:hover{background:var(--color-button)}.bba-prow.active{background:var(--color-selected)}.bba-arrow{flex:0 0 18px;width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;opacity:.8}.bba-arrow i{font-size:18px}.bba-pico{font-size:17px;opacity:.9;flex:0 0 auto}.bba-t-highlight,.bba-t-tip{opacity:.6}.bba-dev{display:flex;align-items:center;gap:6px;margin:18px 0 4px;padding-top:8px;border-top:1px solid var(--color-border);font-size:12px;color:var(--color-subtle_text)}' +
+        '.bba-chips{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px}.bba-chip{display:inline-flex;align-items:center;gap:3px;padding:3px 9px;border:1px solid var(--color-border);border-radius:12px;background:transparent;cursor:pointer;font-size:12px}.bba-chip.on{background:var(--color-accent);color:var(--color-accent_text,#fff);border-color:transparent}.bba-chip i{font-size:12px;opacity:.8}.bba-half{flex:1;width:auto;margin-top:0;min-width:0}.bba-badge{margin-left:auto;padding:0 5px;border-radius:8px;background:var(--color-accent);color:var(--color-accent_text,#fff);font-size:10px;font-weight:bold}.bba-ta{height:auto;resize:vertical;font-family:inherit}.bba-warn{color:#e8a33d}.bba-lc{flex:0 0 26px;font-size:10px;font-weight:bold;opacity:.8}.bba-lc.bad{color:#e8a33d}' +
+        '.bbui-trscroll{max-height:60vh;overflow:auto;border:1px solid var(--color-border);border-radius:6px;margin-top:8px}.bbui-trtab{border-collapse:collapse;width:100%}.bbui-trtab th{position:sticky;top:0;background:var(--color-back);text-align:left;padding:6px;font-size:12px;z-index:1}.bbui-trtab td{padding:4px 6px;vertical-align:top;border-top:1px solid var(--color-border)}.bbui-trname{min-width:120px;font-size:12px}.bbui-trname small{display:block;opacity:.6}.bbui-trtab textarea{width:100%;min-width:140px;box-sizing:border-box;resize:vertical}.bbui-trtab textarea.bbui-trempty{background:rgba(232,163,61,.18);outline:1px solid #e8a33d}.bbui-trwarn{font-size:10px;color:#e8a33d;margin-top:2px}' +
         '.bbui-root{overflow-y:auto;overflow-x:hidden;max-height:calc(100vh - 130px);box-sizing:border-box}.bbui{padding:6px;font-size:12px}.bbui-artist{font-size:13px}.bbui-big{font-size:15px;font-weight:bold;margin:12px 0 4px}.bbui-btn{width:100%;padding:7px;font-size:13px;margin:4px 0}.bbui-wide{width:100%;padding:6px;font-size:13px}.bbui-win{display:flex;align-items:center;gap:6px;padding:5px 6px;border-radius:4px;cursor:pointer;font-size:14px}.bbui-win:hover{background:var(--color-button)}.bbui-win.active{background:var(--color-selected)}.bbui-win .bbui-star{font-size:18px}.bbui-card{border:1px solid var(--color-border);border-radius:5px;padding:8px;margin:4px 0}.bbui-ib{flex:0 0 auto;width:24px;height:24px;min-width:0;padding:0;display:inline-flex;align-items:center;justify-content:center}.bbui-ib i{font-size:16px}.bbui-win .bbui-star i{font-size:18px}.bbui-wlist{max-height:240px;overflow-y:auto}.bbui-wname{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.bbui-hint2{font-size:11px;margin:2px 0}.bbui-dev{margin-top:14px;opacity:.8}.bbui-tool.bbui-wide2{width:124px}.bbui-tool:disabled{opacity:.5}.bbui-row{display:flex;gap:6px;align-items:center;margin:2px 0}.bbui-row label{flex:0 0 100px;opacity:.8}' +
         '.bbui-row input,.bbui-row select,.bbui-action>select{flex:1;min-width:0}.bbui-box{border:1px solid var(--color-border);border-radius:4px;padding:5px;margin:6px 0}' +
         '.bbui-screen{display:flex;align-items:center;gap:4px;padding:2px 4px;border-radius:3px}.bbui-screen.active{background:var(--color-selected)}.bbui-name{flex:1;cursor:pointer}' +
@@ -3244,10 +3847,49 @@
             for (const a of list) { try { MenuBar.addAction(a, 'tools'); } catch (e2) {} }
         }
         try { const tb = Toolbars.outliner; if (tb) { for (const a of list.slice(0, 4)) tb.add(a); tb.update(); } } catch (e) {}
+        makePieceTypeMenu();
+    }
+
+    // Group context menu (outliner, any mode): "Tipo de pieza UI" > Panel / Botón / Imagen / Texto / Sin tipo.
+    // Personaje is not offered: characters come from the "Personaje" import (wrapper `personaje_*` + animations), so they are only shown (checked, read-only).
+    let pieceMenuAction = null;
+    function makePieceTypeMenu() {
+        const ctxGroup = (ctx) => (ctx instanceof Group ? ctx : (typeof Group !== 'undefined' ? Group.first_selected : null)) || null;
+        const targets = (g) => {
+            let list = [];
+            try { const m = Group.multi_selected; if (Array.isArray(m) && m.includes(g)) list = m.slice(); } catch (e) {}
+            return list.length ? list : [g];
+        };
+        const apply = (g, kind) => {
+            const errs = [];
+            for (const t of targets(g)) { try { setPieceType(t.name, kind); } catch (e) { errs.push(e.message); } }
+            if (errs.length) Blockbench.showQuickMessage(errs[0], 3000);
+        };
+        const items = [['panel', 'Panel'], ['button', 'Botón'], ['image', 'Imagen'], ['text', 'Texto'], ['decor', 'Sin tipo']];
+        pieceMenuAction = new Action('bb_ui_piece_type', {
+            name: 'Tipo de pieza UI', icon: 'category',
+            condition: (ctx) => { try { const g = ctxGroup(ctx); return isUi() && !!g && !isFolderGroup(g); } catch (e) { return false; } },
+            children: (ctx) => {
+                const g = ctxGroup(ctx);
+                if (!g) return [];
+                if (/^personaje_/.test(g.name)) return [{ name: 'Personaje (se añade con «Personaje»)', icon: 'pets', marked: true, click() {} }];
+                const cur = markedKind(g.name);
+                return items.map(([k, label]) => ({ id: k, name: label, icon: (PIECE_TYPES[k] || PIECE_TYPES.decor).icon, marked: cur === k, click() { apply(g, k); } }));
+            },
+        });
+        actions.push(pieceMenuAction);
+        try { Group.prototype.menu.addAction(pieceMenuAction); }
+        catch (e) { try { Group.prototype.menu.structure.push(pieceMenuAction); } catch (e2) { console.warn('BB UI Builder: group menu', e2); } }
+    }
+    function removePieceTypeMenu() {
+        const a = pieceMenuAction; pieceMenuAction = null;
+        if (!a) return;
+        try { Group.prototype.menu.removeAction(a.id); }
+        catch (e) { try { const st = Group.prototype.menu.structure, i = st.indexOf(a); if (i >= 0) st.splice(i, 1); } catch (e2) {} }
     }
 
     // ------------------------------------------------------------------ mode
-    // Fourth editor tab ("UI"), next to Edit / Paint / Animate: the UI panels live here, with the outliner and textures.
+    // Fourth editor tab ("UI"), next to Edit / Paint / Animate: only the UI panels live here (no outliner / textures panels; pieces are picked from the "Piezas" list).
     function registerMode() {
         if (typeof Mode === 'undefined') return;
         modeObj = new Mode(MODE_ID, {
@@ -3256,7 +3898,7 @@
             default_tool: 'move_tool',
             category: 'navigate',
             condition: () => isUi(),
-            onSelect() { try { syncState(); applyVisibility(); safeZone(); applyGameView(true); refreshPanels(); } catch (e) { console.warn('BB UI Builder: mode', e); } },
+            onSelect() { try { state.rev++; syncState(); applyVisibility(); safeZone(); applyGameView(true); refreshPanels(); } catch (e) { console.warn('BB UI Builder: mode', e); } },
             onUnselect() { try { if (state.preview.on) previewStop(); restoreView(); } catch (e) {} },
         });
         for (const id of SHARED_PANELS) {
@@ -3367,7 +4009,7 @@
                 exportAndBuild: (opts) => exportAndBuild(opts),
                 addImage, addText, addFont, removeFont, setSafe, applyRoleColors, setProfile,
                 imageDialog, textDialog, fontDialog, templateDialog,
-                applyTemplate, generateTooltip, setTooltip, createUiAnimation, editUiAnimation,
+                applyTemplate, generateTooltip, setTooltip, setLang, addLanguage, removeLanguage, setTextPiece, setPieceLang, translationsDialog, createUiAnimation, editUiAnimation,
                 addElement, createHighlight, applyGameView, previewMove, previewAccept, bonePositions,
                 createWindow, renameWindow, deleteWindow, setTransition, addCharacter, importCharacter, scaleCharacter, removeCharacter, testInGame, setDev,
                 safeZoneInfo: () => (safeObj ? clone(safeObj.bbui_info) : null),
@@ -3394,6 +4036,7 @@
                 }
             });
             step(() => { const tb = Toolbars.outliner; if (tb) { for (const a of actions) { const i = tb.children.indexOf(a); if (i >= 0) tb.children.splice(i, 1); } tb.update(); } });
+            step(removePieceTypeMenu);
             step(() => menus.forEach((m) => m.delete && m.delete()));
             step(() => actions.forEach((a) => a.delete()));
             step(() => panels.forEach((p) => p.delete()));
