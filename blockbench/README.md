@@ -9,32 +9,49 @@ Disena UIs 3D de Minecraft Bedrock. Cada hueso del modelo es un elemento (boton,
 Blockbench (escritorio, 4.10+) -> File -> Plugins -> icono "Load Plugin from File" -> elegir `blockbench/bb_ui_builder.js`.
 Hay que recargarlo tras editar el archivo.
 
-## Flujo de trabajo
+## Modo artista (por defecto)
 
-1. File -> New -> **Minecraft UI**. Se crean los datos por defecto (id desde el nombre, namespace `bbui`, pantalla `main`).
-   Arriba a la derecha aparece un cuarto modo, **UI** (junto a Editar / Pintar / Animar): ahi estan los paneles UI Screens,
-   UI Element y UI Settings, con el outliner y las texturas. Modela en Editar y pinta en Pintar; todo lo de UI se hace en el modo UI.
-2. Menu **UI** (o el "+" del outliner): *Add Button / Image / Number / Model Slot*. Cada uno crea un grupo con un plano plano
-   mirando al norte (-Z) y lo asigna a la pantalla activa. *Add Button* crea ademas `btn_N_hl` (resaltado, un poco mas grande y detras).
-   Pinta la textura (unica) como siempre.
-3. Panel **UI Screens**: anade/renombra/elimina pantallas, elige la de inicio, activa una (oculta los huesos de las demas; "Mostrar todo"
-   los enseña), `default_focus` y `actionbar`. *Preview navigation*: foco con flechas/Enter/Esc usando la misma regla que el runtime.
-4. Panel **UI Element** (con un grupo seleccionado): rol, pantalla, accion del boton (goto/back/close/settings/command/script/set/add/open_ui/sequence),
-   navegacion arriba/abajo/izquierda/derecha, highlight, tooltip, `visible_if`, y query/digits/align para numeros.
-   La accion `settings` (sin campos) abre en juego el formulario de ajustes del jugador; en *Preview navigation* solo muestra un aviso.
-5. Panel **UI Settings**: id, namespace, display, **cursor**, metodos de apertura (item/block/entity/command, con `generate` opcional) y queries.
-6. Panel **UI Animations**: lista todos los roles animables (`idle`, `open`, `close`, `screen.<id>`, `focus.<boton>`, `press.<boton>`) y si ya
-   existe una animacion de Blockbench para cada uno. **Crear** anade la animacion con el nombre correcto (`animation.<id de la UI>.<rol>` para
-   idle/open/close, `animation.<rol>` para screen/focus/press), el loop del contrato (idle/screen/focus en loop; open/close/press una vez) y una
-   duracion por defecto (open 0.5 s, close 0.5 s, press 0.25 s, el resto 2 s; focus 0.5 s) y la selecciona; **Editar** cambia al modo Animate con
-   esa animacion. Las animaciones con un nombre que no encaja salen como avisos: `screen.<id>` / `focus.<hueso>` / `press.<hueso>` con pantalla u
-   hueso inexistente hacen fallar el build; cualquier otro nombre (p. ej. `pulse`) se reproduce siempre mientras la UI esta abierta. La
-   exportacion ya escribe `animations.json` con todas las animaciones del proyecto.
-7. **UI: Validate** y **UI: Export to pack**. La primera vez pide la carpeta `<tu proyecto Regolith>/packs/data/bb_ui` (se recuerda; "Set export folder" la cambia).
-   La exportacion valida primero y se aborta si hay errores.
-8. En tu proyecto Regolith: `regolith run build`.
+Un solo panel, **UI** (barra derecha, modo UI), para quien solo dibuja ventanas, transiciones, personajes y dice a que ventana va cada boton.
+Todo lo demas (paneles Ventanas, Inspector, Ajustes y Animaciones, menus avanzados) queda oculto hasta marcar **Modo programador** (casilla al final del panel).
 
-Los datos viajan dentro del `.bbmodel` (clave `bbui`). Los huesos ocultos por la pantalla activa se muestran temporalmente al exportar la geometria.
+- **Ventanas**: clic = ver solo esa ventana (mas la carpeta `comunes`) y encuadrar la vista; estrella = ventana inicial; lapiz = renombrar; X = borrar.
+  *+ Ventana* crea la carpeta `ventana_<nombre>` y la ventana. `comunes` (se ve siempre) se crea al hacer comun una pieza o con una plantilla.
+- **Seleccionado**: clic en el visor selecciona la pieza (grupo dentro de la carpeta de la ventana o de `comunes`). *Es: Decoracion / Boton*; un boton
+  tiene *Al pulsar va a*: Ventana / Volver / Cerrar. Un personaje muestra *Tamano x* y *Quitar*.
+- **Transicion al entrar**: Ninguna, deslizar (arriba, abajo, izquierda), zoom o Personalizada (animacion vacia `animation.screen.<id>`, abre el modo Animate).
+- **+ Imagen / + Texto / + Boton** crean la pieza dentro de la carpeta de la ventana activa. **+ Personaje** pide un `.bbmodel`, lo une al proyecto dentro de
+  `personaje_<nombre>`, **junta su textura con la principal** (debajo, la textura queda mas alta) y conserva sus animaciones (suenan siempre en el juego).
+  Es una accion sin deshacer: guarda antes.
+- **Probar en el juego**: guarda el proyecto dentro de `packs/data/bb_ui/<ui>/` (Guardar como), pulsa el boton y espera el aviso "Listo: abre el mundo y usa /<comando>".
+  Al guardar a mano dentro de esa carpeta, el plugin exporta `ui.json`, `geo.json`, `texture.png` y `animations.json` ahi mismo (y pregunta una vez si el id debe llamarse como la carpeta).
+- Un proyecto nuevo abre en modo UI y, si esta vacio, ofrece empezar con una plantilla. Las plantillas generan `comunes` (fondo) y una carpeta `ventana_<id>` por ventana; sin resaltados ni tooltips salvo en Modo programador.
+
+## Flujo de trabajo del programador (Modo programador)
+
+1. File -> New -> **Minecraft UI** (o *Nueva UI desde plantilla*). Arriba a la derecha hay un cuarto modo, **UI**. Al entrar, la camara pasa
+   a una **vista de juego** (ortogonal, de frente, centrada en la UI) y se dibuja el **marco de pantalla** (16:9, activo por defecto).
+   Al salir se restaura tu camara. La constante `VIEW_PRESET` (arriba del plugin) elige el angulo; el boton *Vista de juego* la reaplica.
+2. Panel izquierdo **Ventanas**: botones grandes *+ Boton*, *+ Texto*, *+ Imagen*, *Probar* (navegacion con flechas/Enter/Esc),
+   *Exportar* (exporta y construye si ya hay carpeta configurada), *Ajustes* y *Vista de juego*. Debajo, la lista de ventanas: clic = editar esa
+   ventana, doble clic o lapiz = renombrar, estrella = ventana inicial, X = eliminar (pide confirmacion). Casillas: *Mostrar todas las capas*,
+   *Marco de pantalla*, *Mostrar textos de ayuda*.
+3. **Clic en el visor** para elegir un elemento: se selecciona el elemento entero de la ventana activa (boton, su resaltado o su texto de ayuda)
+   y se puede arrastrar completo. Los grupos elegidos en el outliner se respetan tal cual.
+4. Panel derecho **Inspector** (sigue a la seleccion):
+   - nada seleccionado: la ventana (nombre, boton inicial; en *Avanzado* texto actionbar y decorado);
+   - un boton: nombre, **Al pulsar** (ir a otra ventana, volver, cerrar, abrir ajustes, abrir otra UI, comando, funcion de script,
+     guardar/sumar un valor, varias acciones), **Texto de ayuda**, **Resaltado al enfocar** (*Crear resaltado* dibuja un marco de 4 barras;
+     usa la zona de textura del resaltado de la plantilla o la ultima elegida, y si no hay ninguna te deja elegirla) y *Avanzado*
+     (navegacion, grupo del resaltado, `visible_if`);
+   - imagen / numero / modelo: sus campos con nombres en castellano;
+   - un grupo que no es de esta ventana: *Convertir en boton / imagen* o *Anadir como decorado*.
+5. **+ Boton** crea un boton terminado (placa + texto "BOTON" si hay fuente + resaltado si se conoce su textura), ya registrado y seleccionado.
+6. **Ajustes** abre el panel *Ajustes de la UI* (distancia, campo de vision, sonidos, como se abre, valores, cursor, fuentes, validar/exportar);
+   desde ahi, *Animaciones...* abre *Animaciones de la UI* (roles animables, ver `docs/CONTRACT.md` 3.1). Ambos paneles solo existen mientras estan abiertos.
+7. En tu proyecto Regolith: `regolith run build`. La primera exportacion pide la carpeta `<tu proyecto Regolith>/packs/data/bb_ui`.
+
+Los menus **UI** siguen disponibles. Si venias de una version anterior y los paneles quedan mal colocados, restablece el layout de Blockbench.
+Los datos viajan dentro del `.bbmodel` (clave `bbui`). Los huesos ocultos por la ventana activa se muestran temporalmente al exportar la geometria.
 
 ### Tooltips
 

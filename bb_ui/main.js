@@ -8,6 +8,8 @@ const fs = require('fs');
 const path = require('path');
 const { Canvas } = require('./lib/png.js');
 const SERVER_UI_VERSION = '2.0.0';
+// animations.json roles that play once each time their condition turns true (wired through an animation controller)
+const ONE_SHOT_KINDS = new Set(['screen', 'open', 'close', 'press']);
 const MIN_SERVER_VERSION = '2.8.0'; // lowest version checked: all runtime APIs are in the 2.8.0 typings; it may also work on older versions
 
 function readSettings() {
@@ -1306,6 +1308,7 @@ async function generateUi(uiId, ui, geo, ctx) {
     animate.push({ cursor: `${viewer} && ${P('cur')}` });
   }
   // authored animations (animations.json): wiring by role, see CONTRACT 3.1
+  const controllers = {};
   for (const a of plan?.list || []) {
     const full = `animation.bb_ui.${ID}.${a.S}`;
     anims[full] = a.def;
@@ -1323,10 +1326,31 @@ async function generateUi(uiId, ui, geo, ctx) {
       }
       expr = parts.join(' || ');
     } else expr = viewer; // idle, open and any other name
+    const loops = a.def && (a.def.loop === true || a.def.loop === 'true');
+    if (!loops && ONE_SHOT_KINDS.has(a.kind)) {
+      // One-shot roles go through an animation controller: a plain conditional entry in scripts.animate does not
+      // restart when its condition turns true again (seen in game: an entry transition stayed on its first frame).
+      // The controller enters "play" every time the condition becomes true and plays the animation from the start.
+      if (a.def && a.def.loop === undefined) a.def.loop = 'hold_on_last_frame';
+      const ctrl = `controller.animation.bb_ui.${ID}.${a.S}`;
+      controllers[ctrl] = {
+        initial_state: 'default',
+        states: {
+          default: { transitions: [{ play: `(${expr}) ? 1.0 : 0.0` }] },
+          play: { animations: [a.S], transitions: [{ default: `(${expr}) ? 0.0 : 1.0` }] },
+        },
+      };
+      animRefs[`${a.S}_ctrl`] = ctrl;
+      animate.push(`${a.S}_ctrl`);
+      continue;
+    }
     animate.push({ [a.S]: expr });
   }
   if (animate.length) {
     writeJson(path.join(T_RP, `animations/bb_ui/${ID}.animation.json`), { format_version: '1.8.0', animations: anims });
+  }
+  if (Object.keys(controllers).length) {
+    writeJson(path.join(T_RP, `animation_controllers/bb_ui/${ID}.ac.json`), { format_version: '1.10.0', animation_controllers: controllers });
   }
 
   // ---- client entity

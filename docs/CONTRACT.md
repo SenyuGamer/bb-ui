@@ -178,6 +178,13 @@ Sin prefijo `animation.`, `N` es el nombre entero. `N` vacío es error. (Limitac
 | `press.<hueso>` | `(screen == s && press == i+1) \|\| …` análogo | una vez al aceptar ese botón |
 | cualquier otro (p. ej. `model.spin`, `pulse`) | `viewer` | siempre mientras la UI está abierta (modelos importados en loop) |
 
+**Una sola vez por activación.** Los roles `screen.<id>`, `open`, `close` y `press.<hueso>` que NO hacen bucle no van
+directo en `scripts.animate` (una entrada condicional no vuelve a empezar al reactivarse: visto en juego, la transición se
+quedaba en su primer fotograma). El filtro genera `controller.animation.bb_ui.<ID>.<S>` en
+`RP/animation_controllers/bb_ui/<ID>.ac.json` con estados `default` → `play` (cuando la condición pasa a verdadera, la
+animación arranca desde 0) → `default` (cuando deja de serlo), lo declara en el entity como `<S>_ctrl` y lo pone siempre en
+`animate`. Si la animación no declara `loop`, el filtro le pone `hold_on_last_frame`. Con `loop: true` siguen directos.
+
 **Validación.** Son errores (build falla): JSON inválido o sin objeto `animations`; `screen.<id>` con pantalla inexistente; `focus.<hueso>` / `press.<hueso>` con un hueso que no está en `geo.json` o que no es `button` en ninguna pantalla; `S` duplicado/reservado; `close` sin duración; que el total de propiedades supere 32.
 Es un aviso (`console.warn`): un hueso animado (clave de `bones`) que no está en `geo.json` (se elimina de la animación).
 `closing` y `press` solo existen (y solo cuentan para el límite de 32) si hay animación `close` / alguna `press.*`.
