@@ -553,7 +553,7 @@
     }
     function refreshPanels() {
         try { if (typeof updateInterfacePanels === 'function') updateInterfacePanels(); } catch (e) {}
-        try { for (const id of ['bb_ui_artist2', 'bb_ui_screens', 'bb_ui_element', 'bb_ui_settings', 'bb_ui_animations']) { const p = Panels[id]; if (p && p.updateSlot) p.updateSlot(); } } catch (e) {}
+        try { for (const id of ['bb_ui_artist2', 'bb_ui_pieces', 'bb_ui_screens', 'bb_ui_element', 'bb_ui_settings', 'bb_ui_animations']) { const p = Panels[id]; if (p && p.updateSlot) p.updateSlot(); } } catch (e) {}
     }
     function setPanelFlag(key, on) { state[key] = !!on; refreshPanels(); }
 
@@ -3258,14 +3258,6 @@
         <button class="bbui-ib bba-hov" title="Borrar la ventana" @click.stop="remove(s.id)"><i class="material-icons">delete_outline</i></button></div></div>
         <button class="bba-add" @click="addWindow"><i class="material-icons">add</i> Nueva ventana</button>
 
-        <div class="bba-sec"><i class="material-icons">account_tree</i><span>Piezas</span></div>
-        <div v-if="!pieceRows.length" class="bba-dim">Esta ventana todavía no tiene piezas.</div>
-        <div v-else class="bba-plist">
-        <div v-for="(r, i) in pieceRows" :key="r.name + '#' + i" class="bba-prow" :class="{active: r.name === activeName}" :style="{paddingLeft: (2 + r.depth * 14) + 'px'}" :title="r.name" @click="pickPiece(r.name)">
-        <span class="bba-arrow" @click.stop="r.kids ? toggleRow(r) : 0"><i v-if="r.kids" class="material-icons">{{r.open ? 'expand_more' : 'chevron_right'}}</i></span>
-        <i class="material-icons bba-pico" :class="'bba-t-' + r.type">{{r.icon}}</i>
-        <span class="bbui-wname">{{r.label}}</span><span v-if="r.lang" class="bba-badge" :title="'Solo se ve en ' + langName(r.lang)">{{r.lang.toUpperCase()}}</span></div></div>
-
         <div class="bba-sec"><i class="material-icons">ads_click</i><span>Seleccionado</span></div>
         <div v-if="!piece" class="bba-empty"><i class="material-icons">touch_app</i><div>Haz clic en algo de la vista para editarlo</div></div>
         <div v-else-if="isChar" class="bba-card">
@@ -3336,6 +3328,16 @@
         <button class="bba-btn bba-primary" :disabled="st.building" title="Guarda, exporta y ejecuta regolith run (los packs van a tu Minecraft)" @click="testGame"><i class="material-icons">terminal</i> {{st.building ? 'Ejecutando...' : 'regolith run'}}</button>
         <div class="bba-dim">Guarda, exporta y lleva los packs a tu Minecraft.</div>
         <label class="bba-dev"><input type="checkbox" :checked="st.dev" @change="setDevMode($event.target.checked)"> Modo programador</label></div>`;
+
+    // "Piezas": its own panel (the artist can move / float / resize it like any Blockbench panel)
+    const TPL_PIECES = `<div class="bbui bbui-artist" v-if="st.data">
+        <div class="bba-dim bba-phead">{{nice(st.activeScreen)}}</div>
+        <div v-if="!pieceRows.length" class="bba-dim">Esta ventana todavía no tiene piezas.</div>
+        <div v-else class="bba-plist bba-pfree">
+        <div v-for="(r, i) in pieceRows" :key="r.name + '#' + i" class="bba-prow" :class="{active: r.name === activeName}" :style="{paddingLeft: (2 + r.depth * 14) + 'px'}" :title="r.name" @click="pickPiece(r.name)">
+        <span class="bba-arrow" @click.stop="r.kids ? toggleRow(r) : 0"><i v-if="r.kids" class="material-icons">{{r.open ? 'expand_more' : 'chevron_right'}}</i></span>
+        <i class="material-icons bba-pico" :class="'bba-t-' + r.type">{{r.icon}}</i>
+        <span class="bbui-wname">{{r.label}}</span><span v-if="r.lang" class="bba-badge" :title="'Solo se ve en ' + langName(r.lang)">{{r.lang.toUpperCase()}}</span></div></div></div>`;
 
     // ------------------------------------------------------------------ panels
     function getRootLabel() { try { return localStorage.getItem(STORE_KEY) || '(sin carpeta de exportacion)'; } catch (e) { return ''; } }
@@ -3527,6 +3529,50 @@
                     setDevMode(on) { setDev(on); },
                 },
                 template: '<div class="bbui-root">' + TPL_ARTIST + '</div>',
+            },
+        }));
+
+        panels.push(new Panel('bb_ui_pieces', {
+            id: 'bb_ui_pieces', name: 'Piezas', icon: 'account_tree', growable: true, resizable: true,
+            condition: () => isUi() && inUiMode(),
+            default_position: { slot: 'right_bar', float_position: [0, 0], float_size: [300, 500], height: 500, folded: false },
+            component: {
+                data() { return { st: state, open: {} }; },
+                computed: {
+                    tree() { void this.st.rev; void this.st.groups; void this.st.activeScreen; void this.st.dev; void this.st.showAll; try { return buildPieceTree(this.st.data, this.st.activeScreen); } catch (e) { console.warn('BB UI Builder: pieces', e); return { roots: [], parentOf: {}, names: new Set(), types: {}, btn: {} }; } },
+                    activeName() {
+                        const t = this.tree;
+                        if (t.names.has(this.st.grp)) return this.st.grp;
+                        for (let g = findGroup(this.st.grp); g instanceof Group; g = g.parent) if (t.names.has(g.name)) return g.name;
+                        return t.names.has(this.st.piece) ? this.st.piece : '';
+                    },
+                    langs() { void this.st.rev; const l = this.st.data && this.st.data.languages; return Array.isArray(l) ? l.slice() : []; },
+                    multi() { return this.langs.length > 1; },
+                    pieceRows() {
+                        const out = [], open = this.open, multi = this.multi, trs = (this.st.data && this.st.data.translations) || {};
+                        const rec = (list, depth) => {
+                            for (const r of list) {
+                                const t = PIECE_TYPES[r.type] || PIECE_TYPES.decor;
+                                const isOpen = open[r.name] !== undefined ? open[r.name] : depth === 0;
+                                const label = r.type === 'highlight' || r.type === 'tip' ? t.label : nice(r.type === 'character' ? r.name.replace(/^personaje_/, '') : r.name);
+                                out.push({ name: r.name, type: r.type, icon: t.icon, label, depth, kids: r.kids.length, open: isOpen, lang: multi && trs[r.name] && this.langs.includes(trs[r.name]) ? trs[r.name] : '' });
+                                if (r.kids.length && isOpen) rec(r.kids, depth + 1);
+                            }
+                        };
+                        rec(this.tree.roots, 0);
+                        return out;
+                    },
+                },
+                watch: {
+                    // selecting in the viewport opens the rows above the selection
+                    activeName(n) { for (let p = n && this.tree.parentOf[n]; p; p = this.tree.parentOf[p]) if (this.open[p] !== true) this.$set(this.open, p, true); },
+                },
+                methods: {
+                    nice, langName: core.langName,
+                    pickPiece(name) { const g = findGroup(name); if (g) { selectGroup(g); syncState(); } },
+                    toggleRow(r) { this.$set(this.open, r.name, !r.open); },
+                },
+                template: '<div class="bbui-root">' + TPL_PIECES + '</div>',
             },
         }));
 
@@ -3794,7 +3840,7 @@
         }));
     }
 
-    const CSS = '.bba-sec{display:flex;align-items:center;gap:6px;margin:14px 0 6px;padding-bottom:4px;border-bottom:1px solid var(--color-border);font-size:11px;font-weight:bold;letter-spacing:.06em;text-transform:uppercase;color:var(--color-subtle_text)}.bba-sec:first-child{margin-top:4px}.bba-sec i{font-size:16px}.bba-add{width:100%;margin:6px 0 2px;padding:6px;border:1px dashed var(--color-border);background:transparent;border-radius:6px;display:flex;align-items:center;justify-content:center;gap:4px;cursor:pointer;color:var(--color-subtle_text)}.bba-add:hover{border-color:var(--color-accent);color:var(--color-text)}.bba-add i{font-size:16px}.bbui-win .bba-hov{opacity:0}.bbui-win:hover .bba-hov,.bbui-win.active .bba-hov{opacity:.75}.bbui-star.on i{color:#f5c542}.bba-empty{display:flex;flex-direction:column;align-items:center;gap:4px;padding:12px 8px;border:1px dashed var(--color-border);border-radius:6px;color:var(--color-subtle_text);text-align:center;font-size:12px}.bba-empty i{font-size:22px;opacity:.7}.bba-card{border:1px solid var(--color-border);border-radius:6px;padding:10px;background:var(--color-back)}.bba-title{display:flex;align-items:center;gap:6px;font-size:14px;font-weight:bold;margin-bottom:8px}.bba-title i{font-size:18px;opacity:.8}.bba-lbl{font-size:12px;color:var(--color-subtle_text);margin:10px 0 3px}.bba-full{width:100%;box-sizing:border-box;height:30px}.bba-dim{font-size:11px;color:var(--color-subtle_text);margin-top:4px}.bba-seg{display:flex;border:1px solid var(--color-border);border-radius:6px;overflow:hidden}.bba-seg button{flex:1;padding:6px 4px;border:none;border-radius:0;background:transparent;cursor:pointer;min-width:0}.bba-seg button+button{border-left:1px solid var(--color-border)}.bba-seg button.on{background:var(--color-accent);color:var(--color-accent_text,#fff)}.bba-seg4{flex:0 0 auto}.bba-seg4 button{padding:4px 6px}.bba-seg4 i{font-size:16px}.bba-line{display:flex;gap:6px;align-items:center;margin-top:6px}.bba-line input{flex:1;min-width:0}.bba-tipopts select{flex:1;min-width:0;height:28px}.bba-link{margin-top:6px;padding:2px 0;border:none;background:transparent;cursor:pointer;color:var(--color-subtle_text);display:flex;align-items:center;gap:4px;font-size:12px}.bba-link:hover{color:var(--color-text)}.bba-link i{font-size:15px}.bba-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}.bba-tile{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;cursor:pointer;min-width:0;font-size:13px}.bba-tile i{font-size:20px;opacity:.85}.bba-btn{width:100%;margin-top:6px;padding:7px;border-radius:6px;display:flex;align-items:center;justify-content:center;gap:6px;cursor:pointer;font-size:13px}.bba-btn i{font-size:18px}.bba-btn.on{background:var(--color-selected)}.bba-primary{background:var(--color-accent);color:var(--color-accent_text,#fff);font-weight:bold;padding:9px}.bba-primary:hover{filter:brightness(1.1)}.bba-primary:disabled{opacity:.6}.bba-danger:hover{color:#ff6b6b}.bba-seg5 button{font-size:11px;padding:6px 2px}.bba-seg button:disabled{opacity:.4;cursor:default}.bba-plist{max-height:260px;overflow-y:auto;border:1px solid var(--color-border);border-radius:6px;padding:2px 0;background:var(--color-back)}.bba-prow{display:flex;align-items:center;gap:4px;padding:3px 6px 3px 2px;cursor:pointer;font-size:13px}.bba-prow:hover{background:var(--color-button)}.bba-prow.active{background:var(--color-selected)}.bba-arrow{flex:0 0 18px;width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;opacity:.8}.bba-arrow i{font-size:18px}.bba-pico{font-size:17px;opacity:.9;flex:0 0 auto}.bba-t-highlight,.bba-t-tip{opacity:.6}.bba-dev{display:flex;align-items:center;gap:6px;margin:18px 0 4px;padding-top:8px;border-top:1px solid var(--color-border);font-size:12px;color:var(--color-subtle_text)}' +
+    const CSS = '.bba-sec{display:flex;align-items:center;gap:6px;margin:14px 0 6px;padding-bottom:4px;border-bottom:1px solid var(--color-border);font-size:11px;font-weight:bold;letter-spacing:.06em;text-transform:uppercase;color:var(--color-subtle_text)}.bba-sec:first-child{margin-top:4px}.bba-sec i{font-size:16px}.bba-add{width:100%;margin:6px 0 2px;padding:6px;border:1px dashed var(--color-border);background:transparent;border-radius:6px;display:flex;align-items:center;justify-content:center;gap:4px;cursor:pointer;color:var(--color-subtle_text)}.bba-add:hover{border-color:var(--color-accent);color:var(--color-text)}.bba-add i{font-size:16px}.bbui-win .bba-hov{opacity:0}.bbui-win:hover .bba-hov,.bbui-win.active .bba-hov{opacity:.75}.bbui-star.on i{color:#f5c542}.bba-empty{display:flex;flex-direction:column;align-items:center;gap:4px;padding:12px 8px;border:1px dashed var(--color-border);border-radius:6px;color:var(--color-subtle_text);text-align:center;font-size:12px}.bba-empty i{font-size:22px;opacity:.7}.bba-card{border:1px solid var(--color-border);border-radius:6px;padding:10px;background:var(--color-back)}.bba-title{display:flex;align-items:center;gap:6px;font-size:14px;font-weight:bold;margin-bottom:8px}.bba-title i{font-size:18px;opacity:.8}.bba-lbl{font-size:12px;color:var(--color-subtle_text);margin:10px 0 3px}.bba-full{width:100%;box-sizing:border-box;height:30px}.bba-dim{font-size:11px;color:var(--color-subtle_text);margin-top:4px}.bba-seg{display:flex;border:1px solid var(--color-border);border-radius:6px;overflow:hidden}.bba-seg button{flex:1;padding:6px 4px;border:none;border-radius:0;background:transparent;cursor:pointer;min-width:0}.bba-seg button+button{border-left:1px solid var(--color-border)}.bba-seg button.on{background:var(--color-accent);color:var(--color-accent_text,#fff)}.bba-seg4{flex:0 0 auto}.bba-seg4 button{padding:4px 6px}.bba-seg4 i{font-size:16px}.bba-line{display:flex;gap:6px;align-items:center;margin-top:6px}.bba-line input{flex:1;min-width:0}.bba-tipopts select{flex:1;min-width:0;height:28px}.bba-link{margin-top:6px;padding:2px 0;border:none;background:transparent;cursor:pointer;color:var(--color-subtle_text);display:flex;align-items:center;gap:4px;font-size:12px}.bba-link:hover{color:var(--color-text)}.bba-link i{font-size:15px}.bba-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}.bba-tile{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;cursor:pointer;min-width:0;font-size:13px}.bba-tile i{font-size:20px;opacity:.85}.bba-btn{width:100%;margin-top:6px;padding:7px;border-radius:6px;display:flex;align-items:center;justify-content:center;gap:6px;cursor:pointer;font-size:13px}.bba-btn i{font-size:18px}.bba-btn.on{background:var(--color-selected)}.bba-primary{background:var(--color-accent);color:var(--color-accent_text,#fff);font-weight:bold;padding:9px}.bba-primary:hover{filter:brightness(1.1)}.bba-primary:disabled{opacity:.6}.bba-danger:hover{color:#ff6b6b}.bba-seg5 button{font-size:11px;padding:6px 2px}.bba-seg button:disabled{opacity:.4;cursor:default}.bba-plist{max-height:260px;overflow-y:auto;border:1px solid var(--color-border);border-radius:6px;padding:2px 0;background:var(--color-back)}.bba-pfree{max-height:none;border:none;background:transparent}.bba-phead{margin:0 0 6px}.bba-prow{display:flex;align-items:center;gap:4px;padding:3px 6px 3px 2px;cursor:pointer;font-size:13px}.bba-prow:hover{background:var(--color-button)}.bba-prow.active{background:var(--color-selected)}.bba-arrow{flex:0 0 18px;width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;opacity:.8}.bba-arrow i{font-size:18px}.bba-pico{font-size:17px;opacity:.9;flex:0 0 auto}.bba-t-highlight,.bba-t-tip{opacity:.6}.bba-dev{display:flex;align-items:center;gap:6px;margin:18px 0 4px;padding-top:8px;border-top:1px solid var(--color-border);font-size:12px;color:var(--color-subtle_text)}' +
         '.bba-chips{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px}.bba-chip{display:inline-flex;align-items:center;gap:3px;padding:3px 9px;border:1px solid var(--color-border);border-radius:12px;background:transparent;cursor:pointer;font-size:12px}.bba-chip.on{background:var(--color-accent);color:var(--color-accent_text,#fff);border-color:transparent}.bba-chip i{font-size:12px;opacity:.8}.bba-half{flex:1;width:auto;margin-top:0;min-width:0}.bba-badge{margin-left:auto;padding:0 5px;border-radius:8px;background:var(--color-accent);color:var(--color-accent_text,#fff);font-size:10px;font-weight:bold}.bba-ta{height:auto;resize:vertical;font-family:inherit}.bba-warn{color:#e8a33d}.bba-lc{flex:0 0 26px;font-size:10px;font-weight:bold;opacity:.8}.bba-lc.bad{color:#e8a33d}' +
         '.bbui-trscroll{max-height:60vh;overflow:auto;border:1px solid var(--color-border);border-radius:6px;margin-top:8px}.bbui-trtab{border-collapse:collapse;width:100%}.bbui-trtab th{position:sticky;top:0;background:var(--color-back);text-align:left;padding:6px;font-size:12px;z-index:1}.bbui-trtab td{padding:4px 6px;vertical-align:top;border-top:1px solid var(--color-border)}.bbui-trname{min-width:120px;font-size:12px}.bbui-trname small{display:block;opacity:.6}.bbui-trtab textarea{width:100%;min-width:140px;box-sizing:border-box;resize:vertical}.bbui-trtab textarea.bbui-trempty{background:rgba(232,163,61,.18);outline:1px solid #e8a33d}.bbui-trwarn{font-size:10px;color:#e8a33d;margin-top:2px}' +
         '.bbui-root{overflow-y:auto;overflow-x:hidden;max-height:calc(100vh - 130px);box-sizing:border-box}.bbui{padding:6px;font-size:12px}.bbui-artist{font-size:13px}.bbui-big{font-size:15px;font-weight:bold;margin:12px 0 4px}.bbui-btn{width:100%;padding:7px;font-size:13px;margin:4px 0}.bbui-wide{width:100%;padding:6px;font-size:13px}.bbui-win{display:flex;align-items:center;gap:6px;padding:5px 6px;border-radius:4px;cursor:pointer;font-size:14px}.bbui-win:hover{background:var(--color-button)}.bbui-win.active{background:var(--color-selected)}.bbui-win .bbui-star{font-size:18px}.bbui-card{border:1px solid var(--color-border);border-radius:5px;padding:8px;margin:4px 0}.bbui-ib{flex:0 0 auto;width:24px;height:24px;min-width:0;padding:0;display:inline-flex;align-items:center;justify-content:center}.bbui-ib i{font-size:16px}.bbui-win .bbui-star i{font-size:18px}.bbui-wlist{max-height:240px;overflow-y:auto}.bbui-wname{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.bbui-hint2{font-size:11px;margin:2px 0}.bbui-dev{margin-top:14px;opacity:.8}.bbui-tool.bbui-wide2{width:124px}.bbui-tool:disabled{opacity:.5}.bbui-row{display:flex;gap:6px;align-items:center;margin:2px 0}.bbui-row label{flex:0 0 100px;opacity:.8}' +
