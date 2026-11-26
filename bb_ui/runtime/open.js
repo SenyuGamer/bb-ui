@@ -1,7 +1,8 @@
 // Open triggers for BB UI: item use, block interact, entity interact, custom commands.
 import { world, system, CommandPermissionLevel, CustomCommandStatus } from "@minecraft/server";
 import { UI_REGISTRY } from "./generated/ui_registry.js";
-import { openUi, isUiOpen } from "./api.js";
+import { openUi, isUiOpen, openCalibration } from "./api.js";
+import { SCALE_KEY, calibrationEnabled } from "./session.js";
 
 const PERMISSIONS = {
     any: CommandPermissionLevel.Any,
@@ -48,11 +49,33 @@ export function initOpen() {
     }
 
     if (items.size) {
+        // generated items carry the "bb_ui:open" custom component (afterEvents.itemUse does not fire for them)
+        system.beforeEvents.startup.subscribe(({ itemComponentRegistry }) => {
+            const handler = (ev) => {
+                const ids = items.get(ev.itemStack?.typeId);
+                if (!ids || !ev.source || ev.source.typeId !== "minecraft:player") return;
+                deferOpen(ev.source, ids[0]);
+            };
+            try {
+                itemComponentRegistry.registerCustomComponent("bb_ui:open", { onUse: handler, onUseOn: handler });
+            } catch (e) {
+                console.warn(`[bb_ui] custom item component failed to register: ${e}`);
+            }
+        });
         world.afterEvents.itemUse.subscribe((ev) => {
             const ids = items.get(ev.itemStack?.typeId);
             if (!ids) return;
             if (isUiOpen(ev.source)) return;
             deferOpen(ev.source, ids[0]);
+        });
+        // itemUse does not fire when the player aims at a block: open on the block tap too
+        // (sneaking keeps the normal block interaction, like block triggers)
+        world.beforeEvents.playerInteractWithBlock.subscribe((ev) => {
+            const ids = items.get(ev.itemStack?.typeId);
+            if (!ids || ev.player.isSneaking) return;
+            ev.cancel = true;
+            if (!ev.isFirstEvent) return;
+            deferOpen(ev.player, ids[0]);
         });
     }
 
@@ -79,6 +102,46 @@ export function initOpen() {
             ev.cancel = true;
             const target = ev.target;
             deferOpen(ev.player, ids[0], () => (target.isValid ? { entity: target } : undefined));
+        });
+    }
+
+    // Bedrock requires all custom commands of a pack to share ONE namespace: use the UIs' namespace.
+    const calibNs = Object.values(UI_REGISTRY).find(calibrationEnabled)?.namespace;
+    const calibCmd = `${calibNs}:calibrate`;
+    if (calibNs) {
+        system.beforeEvents.startup.subscribe(({ customCommandRegistry }) => {
+            try {
+                customCommandRegistry.registerCommand(
+                    {
+                        name: calibCmd,
+                        description: "Recalibrate the size of 3D UIs",
+                        permissionLevel: CommandPermissionLevel.Any,
+                        cheatsRequired: false,
+                    },
+                    (origin) => {
+                        const p = origin.sourceEntity ?? origin.initiator;
+                        if (!p || p.typeId !== "minecraft:player") {
+                            return { status: CustomCommandStatus.Failure, message: "Only players can calibrate" };
+                        }
+                        if (isUiOpen(p)) return { status: CustomCommandStatus.Failure, message: "Close the UI first" };
+                        if (pending.has(p.id)) return { status: CustomCommandStatus.Success };
+                        pending.add(p.id);
+                        system.run(() => {
+                            pending.delete(p.id);
+                            try {
+                                if (!p.isValid || isUiOpen(p)) return;
+                                p.setDynamicProperty(SCALE_KEY, undefined);
+                                openCalibration(p);
+                            } catch (e) {
+                                console.warn(`[bb_ui] calibrate failed: ${e}`);
+                            }
+                        });
+                        return { status: CustomCommandStatus.Success };
+                    },
+                );
+            } catch (e) {
+                console.warn(`[bb_ui] command '${calibCmd}' failed to register: ${e}`);
+            }
         });
     }
 

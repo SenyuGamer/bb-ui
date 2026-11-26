@@ -1,5 +1,7 @@
 // Action runner for BB UI (CONTRACT section 2).
-import { gotoScreen, backScreen, closeSession, refreshSession } from "./session.js";
+import { system } from "@minecraft/server";
+import { UI_REGISTRY } from "./generated/ui_registry.js";
+import { gotoScreen, backScreen, closeSession, refreshSession, openSession } from "./session.js";
 
 const uiFunctions = new Map();
 
@@ -25,6 +27,22 @@ export function runAction(session, action, bone) {
         case "close":
             closeSession(session, "action");
             break;
+        case "open_ui": {
+            if (typeof action.ui !== "string" || !UI_REGISTRY[action.ui]) {
+                console.warn(`[bb_ui] open_ui: unknown UI '${action.ui}'`);
+                break;
+            }
+            const source = session.source;
+            closeSession(session, "open_ui");
+            system.run(() => {
+                try {
+                    if (player.isValid) openSession(player, action.ui, { source, fade: false });
+                } catch (e) {
+                    console.warn(`[bb_ui] open_ui failed: ${e}`);
+                }
+            });
+            break;
+        }
         case "command": {
             const cmd = subst(action.command, player);
             if (action.as === "server") player.dimension.runCommand(cmd);

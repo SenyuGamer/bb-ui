@@ -73,6 +73,7 @@ function readJsonIfExists(...candidates) {
   return null;
 }
 const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
+const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 const NAME_RE = /^[a-z0-9_]+$/;
 const ID_RE = /^[a-z0-9_]+:[a-z0-9_]+$/;
 
@@ -129,6 +130,29 @@ function validate(uiId, ui, geoBones, usedGlobal) {
       if (typeof d[k] !== 'number') err(uiId, `display.${k} debe ser numero`);
     }
     if (d.anchor !== 'player' && d.anchor !== 'trigger') err(uiId, 'display.anchor debe ser "player" o "trigger"');
+    const hexOk = (c) => typeof c === 'string' && HEX_RE.test(c);
+    const unit = (v) => typeof v === 'number' && v >= 0 && v <= 1;
+    const sub = (name) => {
+      const v = d[name];
+      if (v === undefined || v === false || v === true) return null;
+      if (!isObj(v)) { err(uiId, `display.${name} debe ser false o un objeto`); return null; }
+      return v;
+    };
+    const bd = sub('backdrop');
+    if (bd) {
+      if (bd.color !== undefined && !hexOk(bd.color)) err(uiId, 'display.backdrop.color debe ser "#rrggbb"');
+      if (bd.opacity !== undefined && !unit(bd.opacity)) err(uiId, 'display.backdrop.opacity debe ser un numero 0..1');
+    }
+    const fd = sub('fade');
+    if (fd) {
+      for (const k of ['in', 'hold', 'out']) {
+        if (fd[k] !== undefined && !(typeof fd[k] === 'number' && fd[k] >= 0)) err(uiId, `display.fade.${k} debe ser un numero >= 0 (segundos)`);
+      }
+      if (fd.color !== undefined && !hexOk(fd.color)) err(uiId, 'display.fade.color debe ser "#rrggbb"');
+    }
+    for (const k of ['hide_hud', 'calibrate']) {
+      if (d[k] !== undefined && typeof d[k] !== 'boolean') err(uiId, `display.${k} debe ser booleano`);
+    }
   }
 
   const queries = ui.queries || {};
@@ -199,6 +223,10 @@ function validate(uiId, ui, geoBones, usedGlobal) {
         break;
       case 'back':
       case 'close':
+        break;
+      case 'open_ui':
+        if (typeof a.ui !== 'string' || !a.ui) err(uiId, `${where}: open_ui necesita ui (string)`);
+        else if (!usedGlobal.uiIds.has(a.ui)) console.warn(`[bb_ui] aviso: ${uiId} ${where}: open_ui a "${a.ui}" que no esta entre las UIs de este build`);
         break;
       case 'command':
         if (typeof a.command !== 'string' || !a.command) err(uiId, `${where}: command vacio`);
@@ -284,11 +312,93 @@ function validate(uiId, ui, geoBones, usedGlobal) {
     maxButtons = Math.max(maxButtons, buttons.length);
   }
 
-  const propCount = 3 + numberCount + condCount;
+  const baseProps = 4 + (d && d.calibrate === false ? 0 : 1) + (d && d.backdrop === false ? 0 : 1); // viewer, screen, focus, yaw (+ calib) (+ bd)
+  const propCount = baseProps + numberCount + condCount;
   if (propCount > MAX_PROPERTIES) {
-    err(uiId, `demasiadas propiedades de entidad: ${propCount} (maximo ${MAX_PROPERTIES}: 3 base + ${numberCount} numeros + ${condCount} visible_if)`);
+    err(uiId, `demasiadas propiedades de entidad: ${propCount} (maximo ${MAX_PROPERTIES}: ${baseProps} base + ${numberCount} numeros + ${condCount} visible_if)`);
   }
-  return { NS, maxButtons };
+  return { NS, maxButtons, propCount };
+}
+
+// ---------------------------------------------------------------- animations.json (CONTRACT 3.1)
+// Document name -> role name N: "animation.<model>.<N>" -> N; "animation.screen|focus|press.<x>" -> as is.
+function animRoleName(doc) {
+  if (!doc.startsWith('animation.')) return doc;
+  const rest = doc.slice('animation.'.length);
+  if (/^(screen|focus|press)\./.test(rest)) return rest;
+  const i = rest.indexOf('.');
+  return i >= 0 ? rest.slice(i + 1) : rest;
+}
+// Duration in seconds: animation_length, else the last keyframe time of any bone channel.
+function animLength(a) {
+  if (typeof a.animation_length === 'number') return a.animation_length;
+  let max = 0;
+  for (const b of Object.values(a.bones || {})) {
+    for (const ch of ['position', 'rotation', 'scale']) {
+      const v = b && b[ch];
+      if (isObj(v)) for (const k of Object.keys(v)) if (Number.isFinite(Number(k))) max = Math.max(max, Number(k));
+    }
+  }
+  return max;
+}
+// Validates animations.json (null = none) and returns the plan used by generateUi, or null when there are none.
+function planAnimations(uiId, ui, geoBones, doc, propCount) {
+  if (doc === null || doc === undefined) return null;
+  if (!isObj(doc) || !isObj(doc.animations)) { err(uiId, 'animations.json: falta el objeto "animations"'); return null; }
+  const screenIds = new Set(ui.screens.filter(isObj).map((x) => x.id));
+  const buttonBones = new Set();
+  for (const sc of ui.screens) for (const e of (isObj(sc) && sc.elements) || []) if (isObj(e) && e.type === 'button') buttonBones.add(e.bone);
+  const plan = { list: [], animatedBones: new Set(), closeTicks: 0, pressTicks: 0, usesClosing: false, usesPress: false };
+  const seen = new Map();
+  for (const [docName, def] of Object.entries(doc.animations)) {
+    const where = `animations.json "${docName}"`;
+    if (!isObj(def)) { err(uiId, `${where}: debe ser un objeto`); continue; }
+    const N = animRoleName(docName);
+    if (!N) { err(uiId, `${where}: nombre vacio tras quitar el prefijo animation.`); continue; }
+    const S = N.toLowerCase().replace(/[^a-z0-9_]/g, '_');
+    if (S === 'backdrop' || S === 'yaw' || /^focus_\d+_\d+$/.test(S)) err(uiId, `${where}: el nombre "${S}" esta reservado`);
+    if (seen.has(S)) err(uiId, `${where}: da el mismo nombre "${S}" que "${seen.get(S)}"`);
+    seen.set(S, docName);
+    let kind = 'always';
+    let arg = null;
+    if (N === 'idle') kind = 'idle';
+    else if (N === 'open') kind = 'open';
+    else if (N === 'close') kind = 'close';
+    else {
+      const m = /^(screen|focus|press)\.(.+)$/.exec(N);
+      if (m) { kind = m[1]; arg = m[2]; }
+    }
+    if (kind === 'screen' && !screenIds.has(arg)) err(uiId, `${where}: la pantalla "${arg}" no existe`);
+    if (kind === 'focus' || kind === 'press') {
+      if (!geoBones.has(arg)) err(uiId, `${where}: el hueso "${arg}" no existe en geo.json`);
+      else if (!buttonBones.has(arg)) err(uiId, `${where}: el hueso "${arg}" no es un boton de ninguna pantalla`);
+    }
+    const len = animLength(def);
+    if (kind === 'close') {
+      if (!(len > 0)) err(uiId, `${where}: close necesita animation_length > 0`);
+      plan.closeTicks = Math.ceil(len * 20 - 1e-6);
+      plan.usesClosing = true;
+    }
+    if (kind === 'press') {
+      plan.pressTicks = Math.max(plan.pressTicks, Math.max(1, Math.ceil(len * 20 - 1e-6)));
+      plan.usesPress = true;
+    }
+    const out = { ...def };
+    if (isObj(def.bones)) {
+      out.bones = {};
+      for (const [b, v] of Object.entries(def.bones)) {
+        if (!geoBones.has(b)) { console.warn(`[bb_ui] aviso: ${uiId} ${where}: el hueso "${b}" no existe en geo.json (se ignora)`); continue; }
+        out.bones[b] = v;
+        plan.animatedBones.add(b);
+      }
+    }
+    plan.list.push({ S, kind, arg, def: out });
+  }
+  const extra = (plan.usesClosing ? 1 : 0) + (plan.usesPress ? 1 : 0);
+  if (propCount + extra > MAX_PROPERTIES) {
+    err(uiId, `demasiadas propiedades de entidad: ${propCount + extra} (maximo ${MAX_PROPERTIES}; las animaciones close/press anaden ${extra})`);
+  }
+  return plan;
 }
 
 // ---------------------------------------------------------------- generation
@@ -373,11 +483,330 @@ function buildDigitsGeo(ID, numbers, boneMap) {
         visible_bounds_height: 4,
         visible_bounds_offset: [0, 1, 0],
       },
-      bones,
+      bones: wrapYaw(bones),
     }],
   };
 }
 const round = (v) => Math.round(v * 1000) / 1000;
+
+// Root bone of every geometry of the entity: the RP rotates it with NS:yaw (the entity body itself never turns).
+const YAW_BONE = '__bbui_yaw';
+// Puts YAW_BONE first and parents every former root bone to it (list order, so draw order, unchanged).
+function wrapYaw(bones) {
+  return [{ name: YAW_BONE, pivot: [0, 0, 0] }, ...bones.map((b) => (b.parent == null ? { ...b, parent: YAW_BONE } : b))];
+}
+
+// ---- backdrop + calibration corners
+const BACKDROP_BLOCKS = 6; // quad side: covers the screen even at 0.05 blocks from the camera
+const BACKDROP_BOUNDS = 40; // visible_bounds of the backdrop geo (the quad is animated up to 16 blocks away from the entity)
+const CALIB_THICK = 1.5; // px
+const CALIB_ARM = 24; // px
+const CALIB_COLOR = [255, 210, 60];
+const BACKDROP_DEFAULT = { color: '#000000', opacity: 1 };
+const hexRgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+
+function writeBackdropTexture(outPath, bd) {
+  const [r, g, b] = hexRgb(bd.color);
+  const a = 255; // always opaque (see bb_ui.backdrop material); `opacity` is accepted but ignored for now
+  const img = new Canvas(4, 2);
+  for (let y = 0; y < 2; y++) {
+    for (let x = 0; x < 2; x++) {
+      img.set(x, y, r, g, b, a);
+      img.set(x + 2, y, CALIB_COLOR[0], CALIB_COLOR[1], CALIB_COLOR[2], 255);
+    }
+  }
+  mkdirp(path.dirname(outPath));
+  fs.writeFileSync(outPath, img.toPng());
+}
+
+// bb: world bbox in px { mn, mx } of all cubes; centerYpx: vertical center of the panel (px).
+function buildBackdropGeo(ID, bb, centerYpx, withBackdrop, withCalib) {
+  const bones = [];
+  const quad = (x0, y0, x1, y1, z, u) => ({
+    origin: [round(Math.min(x0, x1)), round(Math.min(y0, y1)), round(z)],
+    size: [round(Math.abs(x1 - x0)), round(Math.abs(y1 - y0)), 0],
+    uv: { north: { uv: [u, 0], uv_size: [2, 2] } },
+  });
+  if (withBackdrop) {
+    const h = (BACKDROP_BLOCKS * 16) / 2;
+    // quad at the entity origin plane (z = 0); animation.bb_ui.<ID>.backdrop moves the bone along -Z (toward the viewer)
+    bones.push({ name: '__bbui_backdrop', pivot: [0, round(centerYpx), 0],
+      cubes: [quad(-h, centerYpx - h, h, centerYpx + h, 0, 0)] });
+  }
+  if (withCalib) {
+    const cubes = [];
+    const z = bb.mn[2] - 0.5;
+    const t = CALIB_THICK;
+    const L = Math.max(8, Math.min(CALIB_ARM, 0.3 * Math.min(bb.mx[0] - bb.mn[0], bb.mx[1] - bb.mn[1])));
+    for (const [cx, ox] of [[bb.mn[0], -1], [bb.mx[0], 1]]) {
+      for (const [cy, oy] of [[bb.mn[1], -1], [bb.mx[1], 1]]) {
+        // L hugging the corner from outside; inward = -outward. Arms do not overlap.
+        cubes.push(quad(cx + ox * t, cy, cx - ox * L, cy + oy * t, z, 2)); // horizontal arm (with the corner square)
+        cubes.push(quad(cx, cy, cx + ox * t, cy - oy * L, z, 2)); // vertical arm
+      }
+    }
+    bones.push({ name: 'calib', pivot: [0, round(centerYpx), round(z)], cubes });
+  }
+  return {
+    format_version: '1.12.0',
+    'minecraft:geometry': [{
+      description: {
+        identifier: `geometry.bb_ui.${ID}.backdrop`,
+        texture_width: 4,
+        texture_height: 2,
+        visible_bounds_width: BACKDROP_BOUNDS,
+        visible_bounds_height: BACKDROP_BOUNDS,
+        visible_bounds_offset: [0, 1, 0],
+      },
+      bones: wrapYaw(bones),
+    }],
+  };
+}
+
+// ---- Bedrock geometry world transforms
+// Convention (Blockbench's Bedrock codec uses Euler order 'ZYX'): rotation [rx,ry,rz] in degrees,
+// right-handed, around the bone/cube pivot, matrix = Rz * Ry * Rx (X is applied first to a point).
+// A bone's world transform = parent's world transform after its own (rotate around its pivot).
+// Raw geo x is used as is (no mirroring), like nav.js (MODEL_RIGHT_SIGN = 1). A root rotation of
+// [-90,0,0] maps +Y -> -Z, so a book lying flat ends up facing -Z.
+// Affine matrices are flat [m00..m22, tx, ty, tz]: p' = M*p + t.
+const M_ID = [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0];
+function rotMatrix(rot) {
+  // Bedrock geo is Blockbench space mirrored on X, so a geo rotation [rx, ry, rz] is the right-handed rotation
+  // (-rx, ry, -rz) in geo space (verified in game: a book with root [90,0,0] faces -Z).
+  const [bx, by, bz] = (rot || [0, 0, 0]).map((d) => (d || 0) * Math.PI / 180);
+  const [ax, ay, az] = [-bx, by, -bz];
+  const [cx, sx, cy, sy, cz, sz] = [Math.cos(ax), Math.sin(ax), Math.cos(ay), Math.sin(ay), Math.cos(az), Math.sin(az)];
+  return [ // Rz * Ry * Rx
+    cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx,
+    sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx,
+    -sy, cy * sx, cy * cx,
+  ];
+}
+const mApply = (m, p) => [
+  m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[9],
+  m[3] * p[0] + m[4] * p[1] + m[5] * p[2] + m[10],
+  m[6] * p[0] + m[7] * p[1] + m[8] * p[2] + m[11],
+];
+// a ∘ b (apply b first, then a)
+function mMul(a, b) {
+  const r = new Array(12);
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 3; j++) r[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j];
+    r[9 + i] = a[i * 3] * b[9] + a[i * 3 + 1] * b[10] + a[i * 3 + 2] * b[11] + a[9 + i];
+  }
+  return r;
+}
+// rotate by `rot` around `pivot`
+function rotAround(rot, pivot) {
+  const R = rotMatrix(rot);
+  const pv = pivot || [0, 0, 0];
+  const rp = mApply([...R, 0, 0, 0], pv);
+  return [...R, pv[0] - rp[0], pv[1] - rp[1], pv[2] - rp[2]];
+}
+// Fails on duplicate bone names, unknown parents and parent cycles.
+function checkBones(bones, where) {
+  const byName = new Map();
+  const dups = new Set();
+  for (const b of bones) { if (byName.has(b.name)) dups.add(b.name); else byName.set(b.name, b); }
+  if (dups.size) throw new Error(`${where}: duplicate bone names in geo.json: ${[...dups].map((n) => `"${n}"`).join(', ')}`);
+  for (const b of bones) {
+    if (b.parent != null && !byName.has(b.parent)) throw new Error(`${where}: bone "${b.name}" has unknown parent "${b.parent}"`);
+  }
+  for (const b0 of bones) {
+    const chain = new Set();
+    for (let b = b0; b; b = b.parent != null ? byName.get(b.parent) : null) {
+      if (chain.has(b.name)) throw new Error(`${where}: parent cycle at bone "${b.name}"`);
+      chain.add(b.name);
+    }
+  }
+}
+// World-space queries for a (checked) bone list: pivot(b), cubes(b) -> [{ pts: 8 corners, center }].
+function geoWorld(bones) {
+  const byName = new Map(bones.map((b) => [b.name, b]));
+  const world = new Map();
+  const get = (b) => {
+    if (world.has(b.name)) return world.get(b.name);
+    const local = rotAround(b.rotation, b.pivot);
+    const m = b.parent != null ? mMul(get(byName.get(b.parent)), local) : local;
+    world.set(b.name, m);
+    return m;
+  };
+  bones.forEach(get);
+  const cubeInfo = (b, c) => {
+    const o = c.origin;
+    const sz = c.size || [0, 0, 0];
+    const M = mMul(world.get(b.name), c.rotation ? rotAround(c.rotation, c.pivot) : M_ID);
+    const pts = [];
+    for (let i = 0; i < 8; i++) {
+      pts.push(mApply(M, [o[0] + (i & 1 ? sz[0] : 0), o[1] + (i & 2 ? sz[1] : 0), o[2] + (i & 4 ? sz[2] : 0)]));
+    }
+    return { pts, center: mApply(M, [o[0] + sz[0] / 2, o[1] + sz[1] / 2, o[2] + sz[2] / 2]) };
+  };
+  return {
+    pivot: (b) => mApply(world.get(b.name), b.pivot || [0, 0, 0]),
+    matrix: (b) => world.get(b.name),
+    cubes: (b) => (b.cubes || []).map((c) => cubeInfo(b, c)),
+  };
+}
+const bboxOf = (pts) => {
+  const mn = [Infinity, Infinity, Infinity];
+  const mx = [-Infinity, -Infinity, -Infinity];
+  for (const p of pts) for (let k = 0; k < 3; k++) { mn[k] = Math.min(mn[k], p[k]); mx[k] = Math.max(mx[k], p[k]); }
+  return { mn, mx };
+};
+
+// Inverse of rotMatrix: Euler [rx,ry,rz] degrees from a 3x3 rotation (flat, Rz*Ry*Rx).
+function matrixToEuler(m) {
+  const sy = Math.max(-1, Math.min(1, -m[6]));
+  let ax;
+  let ay;
+  let az;
+  if (Math.abs(sy) > 1 - 1e-12) { // gimbal lock (ry = +-90): rz is free, take 0
+    ay = Math.sign(sy) * Math.PI / 2;
+    az = 0;
+    ax = Math.atan2(Math.sign(sy) * m[1], m[4]);
+  } else {
+    ay = Math.asin(sy);
+    ax = Math.atan2(m[7], m[8]);
+    az = Math.atan2(m[3], m[0]);
+  }
+  return [-ax, ay, -az].map((r) => r * 180 / Math.PI); // back to Bedrock geo convention (see rotMatrix)
+}
+const round7 = (v) => { const r = Math.round(v * 1e7) / 1e7; return r === 0 ? 0 : r; };
+
+// Affine inverse of a rigid (rotation + translation) matrix: R' = R^T, t' = -R^T t.
+function mInvRigid(m) {
+  const r = [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]];
+  const t = [m[9], m[10], m[11]];
+  return [...r, -(r[0] * t[0] + r[1] * t[1] + r[2] * t[2]), -(r[3] * t[0] + r[4] * t[1] + r[5] * t[2]), -(r[6] * t[0] + r[7] * t[1] + r[8] * t[2])];
+}
+// xray draws without depth test, and Bedrock does NOT draw separate bones in list order, so draw order can only be
+// controlled inside one bone (cube order). Rebuild the bone list:
+//  - "preserved roots" = the element/highlight bones in refBones (the runtime animates them). Every cube of a root's
+//    subtree is baked INTO the root, in the root's local frame (inverse(world(root)) * world(cube), so scaling the root
+//    around its pivot still works), and sorted back to front by world z. Emptied descendants are dropped. A descendant
+//    whose effective visibility differs from its root's (visOf) cannot be merged: it stays a separate preserved root
+//    (and a warning is printed through warn).
+//  - every other cube is baked to world space into a merged bone keyed by its visibility expression (visOf, '' = always),
+//    without parent/pivot/rotation.
+// Cube pivot default: absent pivot = [0,0,0] of geo space (Bedrock; same as geoWorld), not the cube center.
+// Returns { bones, mergedVis: Map(mergedBoneName -> expression) } ordered back to front (larger z first).
+function flattenForXray(srcBones, gw, refBones, visOf, warn) {
+  const byName = new Map(srcBones.map((b) => [b.name, b]));
+  const kids = new Map();
+  for (const b of srcBones) {
+    if (b.parent == null) continue;
+    if (!kids.has(b.parent)) kids.set(b.parent, []);
+    kids.get(b.parent).push(b.name);
+  }
+  const roots = new Set(refBones.filter((n) => byName.has(n)));
+  // descendants with their own extra visibility condition stay separate roots
+  const scan = (n, rootName) => {
+    for (const ch of kids.get(n) || []) {
+      if (roots.has(ch)) { scan(ch, ch); continue; }
+      if (visOf(ch) !== visOf(rootName)) {
+        roots.add(ch);
+        if (warn) warn(`xray: bone "${ch}" has its own visibility condition inside "${rootName}"; kept as a separate bone (draw order within it may differ)`);
+        scan(ch, ch);
+      } else scan(ch, rootName);
+    }
+  };
+  [...roots].forEach((r) => scan(r, r));
+  // owner root of every bone inside a root's subtree
+  const ownerOf = new Map();
+  const own = (n, r) => {
+    ownerOf.set(n, r);
+    for (const ch of kids.get(n) || []) if (!roots.has(ch)) own(ch, r);
+  };
+  for (const r of roots) own(r, r);
+  const needed = new Set(roots);
+  for (const n of roots) {
+    for (let p = byName.get(n).parent; p != null && !needed.has(p); p = byName.get(p).parent) needed.add(p);
+  }
+  let gi = 0;
+  const used = new Set(byName.keys());
+  const newName = () => { let n; do { n = `__bbui_g${gi++}`; } while (used.has(n)); used.add(n); return n; };
+
+  // bake cube c of bone b with matrix M (cube-bone frame -> target frame); returns { cube, } in the target frame
+  const bake = (b, c, M, rootBone) => {
+    const R = M.slice(0, 9);
+    const pc = c.pivot || [0, 0, 0];
+    const baked = { ...c };
+    if (b.mirror !== undefined && baked.mirror === undefined) baked.mirror = b.mirror;
+    if (b.inflate !== undefined && baked.inflate === undefined) baked.inflate = b.inflate;
+    if (rootBone && b !== rootBone) { // do not inherit the root bone's own mirror/inflate
+      if (baked.mirror === undefined && rootBone.mirror !== undefined) baked.mirror = false;
+      if (baked.inflate === undefined && rootBone.inflate !== undefined) baked.inflate = 0;
+    }
+    const p2 = mApply(M, pc);
+    const Rw = mMul([...R, 0, 0, 0], [...(c.rotation ? rotMatrix(c.rotation) : [1, 0, 0, 0, 1, 0, 0, 0, 1]), 0, 0, 0]).slice(0, 9);
+    const eul = matrixToEuler(Rw).map(round7);
+    baked.origin = [0, 1, 2].map((k) => round7(c.origin[k] - pc[k] + p2[k]));
+    if (eul.some((v) => v !== 0)) { baked.rotation = eul; baked.pivot = p2.map(round7); } else { delete baked.rotation; delete baked.pivot; }
+    return baked;
+  };
+  const worldZ = (b, c) => {
+    const sz = c.size || [0, 0, 0];
+    return mApply(mMul(gw.matrix(b), c.rotation ? rotAround(c.rotation, c.pivot) : M_ID), [0, 1, 2].map((k) => c.origin[k] + sz[k] / 2))[2];
+  };
+
+  const groups = new Map(); // key -> [{ cube, z }]
+  const rootCubes = new Map(); // root name -> [{ cube, z }]
+  for (const b of srcBones) {
+    const owner = ownerOf.get(b.name);
+    if (owner !== undefined) {
+      const rb = byName.get(owner);
+      const M = b === rb ? M_ID : mMul(mInvRigid(gw.matrix(rb)), gw.matrix(b));
+      if (!rootCubes.has(owner)) rootCubes.set(owner, []);
+      for (const c of b.cubes || []) rootCubes.get(owner).push({ cube: bake(b, c, M, rb), z: worldZ(b, c) });
+      continue;
+    }
+    const M = gw.matrix(b);
+    for (const c of b.cubes || []) {
+      const key = visOf(b.name);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push({ cube: bake(b, c, M, null), z: worldZ(b, c) });
+    }
+  }
+
+  const items = []; // { bone, z, parent }
+  for (const b of srcBones) {
+    if (!needed.has(b.name)) continue;
+    const copy = { ...b };
+    let z;
+    if (roots.has(b.name)) {
+      const list = rootCubes.get(b.name) || [];
+      list.sort((p, q) => q.z - p.z); // stable: ties keep source order
+      if (list.length) copy.cubes = list.map((e) => e.cube); else delete copy.cubes;
+      z = list.length ? list.reduce((acc, e) => acc + e.z, 0) / list.length : gw.pivot(b)[2];
+    } else {
+      delete copy.cubes;
+      z = gw.pivot(b)[2];
+    }
+    items.push({ bone: copy, z, parent: b.parent });
+  }
+  const mergedVis = new Map();
+  for (const [key, list] of groups) {
+    list.sort((p, q) => q.z - p.z); // stable: ties keep source order
+    const name = newName();
+    mergedVis.set(name, key);
+    items.push({ bone: { name, pivot: [0, 0, 0], cubes: list.map((e) => e.cube) }, z: list.reduce((acc, e) => acc + e.z, 0) / list.length, parent: null });
+  }
+  items.forEach((it, i) => { it.i = i; });
+  items.sort((p, q) => q.z - p.z || p.i - q.i);
+  const itemOf = new Map(items.map((it) => [it.bone.name, it]));
+  const out = [];
+  const done = new Set();
+  const emit = (it) => {
+    if (done.has(it)) return;
+    done.add(it);
+    if (it.parent != null && itemOf.has(it.parent)) emit(itemOf.get(it.parent));
+    out.push(it.bone);
+  };
+  items.forEach(emit);
+  return { bones: out, mergedVis };
+}
 
 // Custom entity materials, merged into RP/materials/entity.material.
 // bb_ui.xray: drawn over blocks and entities (no depth test), like a screen overlay.
@@ -391,11 +820,26 @@ function writeEntityMaterials() {
     '+states': ['DisableDepthTest', 'DisableDepthWrite'],
   };
   doc.materials['bb_ui.flat:entity_alphatest'] = { '-defines': ['FANCY'] };
+  // With a backdrop (alphablend, drawn in the blend pass) the UI must be drawn in the same pass, after it:
+  // the same states over entity_alphablend (the UI textures only use alpha 0/255, so it looks the same).
+  doc.materials['bb_ui.xray_blend:entity_alphablend'] = {
+    '-defines': ['FANCY'],
+    '+states': ['DisableDepthTest', 'DisableDepthWrite'],
+  };
+  doc.materials['bb_ui.flat_blend:entity_alphablend'] = { '-defines': ['FANCY'] };
+  // backdrop: opaque, WITH depth test and depth write; drawn first (render controller order) so the UI covers it.
+  // A material with DisableDepthTest does not write depth either, so clouds/water/particles drawn later showed over
+  // the UI. The quad sits just in front of the camera (NS:bd), so the depth test cannot hide it behind nearby walls.
+  // Not alphablend: blended parts are drawn in a later pass, over the alphatest UI (seen in game).
+  doc.materials['bb_ui.backdrop:entity_alphatest'] = {
+    '-defines': ['FANCY'],
+  };
   writeJson(file, doc);
 }
 
 async function generateUi(uiId, ui, geo, ctx) {
   const { NS, maxButtons } = ctx;
+  const plan = ctx.animPlan;
   const ID = uiId;
   const P = (n) => `q.property('${NS}:${n}')`;
   const geoDesc = geo['minecraft:geometry'][0];
@@ -448,14 +892,53 @@ async function generateUi(uiId, ui, geo, ctx) {
   });
   // a bone used as an element in several screens may collide with k indices (conditions keyed by bone): keep last, fine.
 
+  // bone transforms (rotations, parent chain) are honoured, see geoWorld
+  checkBones(geoDesc.bones, `ui "${uiId}"`);
+  const gw = geoWorld(geoDesc.bones);
+  const childrenOf = new Map();
+  for (const b of geoDesc.bones) {
+    if (b.parent == null) continue;
+    if (!childrenOf.has(b.parent)) childrenOf.set(b.parent, []);
+    childrenOf.get(b.parent).push(b);
+  }
+  // world corners of the cubes of a bone and all its descendants
+  const subtreePts = (b) => {
+    const pts = gw.cubes(b).flatMap((c) => c.pts);
+    for (const ch of childrenOf.get(b.name) || []) pts.push(...subtreePts(ch));
+    return pts;
+  };
+
+  // vertical center (blocks) of all cubes: the panel is centered on the eyes + height
+  const allPts = [];
+  for (const b of geoDesc.bones) for (const c of gw.cubes(b)) allPts.push(...c.pts);
+  const bbPx = allPts.length ? bboxOf(allPts) : { mn: [0, 0, 0], mx: [0, 0, 0] };
+  const centerY = allPts.length ? round((bbPx.mn[1] + bbPx.mx[1]) / 2 / 16) : 0;
+  const bbox = { min: bbPx.mn.map((v) => round(v / 16)), max: bbPx.mx.map((v) => round(v / 16)) };
+
+  // world-space center (pixels) of the bbox of the bone's cubes and its descendants' (fallback: world pivot)
   const bonePos = {};
-  for (const b of geoDesc.bones) bonePos[b.name] = b.pivot ? [...b.pivot] : [0, 0, 0];
+  for (const b of geoDesc.bones) {
+    const pts = subtreePts(b);
+    if (pts.length) {
+      const { mn, mx } = bboxOf(pts);
+      bonePos[b.name] = [0, 1, 2].map((k) => round((mn[k] + mx[k]) / 2));
+    } else {
+      bonePos[b.name] = gw.pivot(b).map(round);
+    }
+  }
 
   // ---- BP entity
   const props = {};
   props[`${NS}:viewer`] = { type: 'bool', default: false, client_sync: true };
   props[`${NS}:screen`] = { type: 'int', range: [0, Math.max(ui.screens.length - 1, 1)], default: screenIndex[ui.start_screen], client_sync: true };
   props[`${NS}:focus`] = { type: 'int', range: [0, Math.max(maxButtons, 1)], default: 0, client_sync: true };
+  const calibrate = ui.display?.calibrate !== false;
+  if (calibrate) props[`${NS}:calib`] = { type: 'bool', default: false, client_sync: true };
+  // float property: Bedrock rejects integer-looking JSON numbers (0, 16) as float default/range
+  props[`${NS}:yaw`] = { type: 'float', range: [-360.5, 360.5], default: 0.0001, client_sync: true };
+  if (ui.display?.backdrop !== false) props[`${NS}:bd`] = { type: 'float', range: [0.0001, 16.5], default: 0.0001, client_sync: true };
+  if (plan?.usesClosing) props[`${NS}:closing`] = { type: 'bool', default: false, client_sync: true };
+  if (plan?.usesPress) props[`${NS}:press`] = { type: 'int', range: [0, Math.max(maxButtons, 1)], default: 0, client_sync: true };
   for (let k = 0; k < nk; k++) props[`${NS}:n${k}`] = { type: 'int', range: [0, 999999999], default: 0, client_sync: true };
   for (let k = 0; k < vk; k++) props[`${NS}:v${k}`] = { type: 'bool', default: false, client_sync: true };
   const entityId = `${NS}:ui_${ID}`;
@@ -473,7 +956,8 @@ async function generateUi(uiId, ui, geo, ctx) {
         'minecraft:physics': { has_gravity: false, has_collision: false },
         'minecraft:collision_box': { width: 0.0001, height: 0.0001 },
         'minecraft:pushable': { is_pushable: false, is_pushable_by_piston: false },
-        'minecraft:damage_sensor': { triggers: { cause: 'all', deals_damage: 'no' } },
+        'minecraft:damage_sensor': { triggers: [{ cause: 'suffocation', deals_damage: 'no' }, { cause: 'all', deals_damage: 'no' }] },
+        'minecraft:health': { value: 1000000, max: 1000000 },
         'minecraft:knockback_resistance': { value: 1 },
         'minecraft:type_family': { family: ['bb_ui'] },
       },
@@ -496,18 +980,20 @@ async function generateUi(uiId, ui, geo, ctx) {
       const [ins, iname] = o.item.split(':');
       const key = `${ins}_ui_item_${iname}`;
       writeJson(path.join(T_BP, `items/bb_ui/${iname}.json`), {
-        format_version: '1.21.0',
+        format_version: '1.21.90',
         'minecraft:item': {
           description: { identifier: o.item, menu_category: { category: 'items' } },
           components: {
             'minecraft:icon': { textures: { default: key } },
             'minecraft:max_stack_size': 1,
+            'bb_ui:open': {},
           },
         },
       });
       itemTex.texture_data[key] = { textures: o.generate.texture };
       itemTexDirty = true;
       langLines.push(`item.${o.item}=${o.generate.name}`);
+      langLines.push(`item.${o.item}.name=${o.generate.name}`);
     } else if (o.type === 'block') {
       const [bns, bname] = o.block.split(':');
       const key = `${bns}_ui_block_${bname}`;
@@ -529,23 +1015,43 @@ async function generateUi(uiId, ui, geo, ctx) {
   if (itemTexDirty) writeJson(path.join(T_RP, 'textures/item_texture.json'), itemTex);
   if (terrainDirty) writeJson(path.join(T_RP, 'textures/terrain_texture.json'), terrain);
 
+  const viewer = P('viewer');
+  // Bedrock part_visibility does not cascade to child bones: each bone gets its own condition AND every ancestor's.
+  const ownExpr = new Map();
+  for (const [bone, conds] of boneConds) {
+    const uniq = [...new Set(conds)];
+    ownExpr.set(bone, uniq.length === 1 ? uniq[0] : uniq.map((c) => `(${c})`).join(' || '));
+  }
+  const parentOf = new Map(geoDesc.bones.map((b) => [b.name, b.parent]));
+  // effective condition of a bone ('' = none): its own ANDed with all ancestors'
+  const visOf = (name) => {
+    const chain = [];
+    for (let n = name, guard = 0; n && guard < 64; n = parentOf.get(n), guard++) {
+      if (ownExpr.has(n)) chain.push(ownExpr.get(n));
+    }
+    return chain.map((c) => `(${c})`).join(' && ');
+  };
+  let outBones = geoDesc.bones;
+  let mergedVis = new Map();
+
   // ---- RP geometry / textures
   const geoOut = JSON.parse(JSON.stringify(geo));
   geoOut['minecraft:geometry'][0].description.identifier = `geometry.bb_ui.${ID}`;
   const xray = ui.display?.xray !== false;
   if (xray) {
-    // Without depth test the draw order decides what is on top: draw back to front.
-    // The UI faces -Z toward the viewer, so a larger z is further back.
-    const depth = (b) => {
-      const cs = b.cubes || [];
-      if (!cs.length) return b.pivot ? b.pivot[2] : 0;
-      return cs.reduce((s, c) => s + c.origin[2] + (c.size?.[2] || 0) / 2, 0) / cs.length;
-    };
-    const bones = geoOut['minecraft:geometry'][0].bones;
-    bones.forEach((b, i) => { b.__i = i; });
-    bones.sort((a, b) => depth(b) - depth(a) || a.__i - b.__i);
-    bones.forEach((b) => { delete b.__i; });
+    // Without depth test the draw order decides what is on top: draw back to front, cube by cube.
+    // The UI faces -Z toward the viewer, so a larger z is further back. bonePos/centerY above were
+    // computed from the original geometry. Bones used by elements/highlights keep their structure.
+    const refs = [];
+    for (const sc of ui.screens) for (const e of sc.elements || []) { refs.push(e.bone); if (e.highlight) refs.push(e.highlight); }
+    if (plan) refs.push(...plan.animatedBones); // animated bones keep their name/pivot (preserved roots)
+    const flat = flattenForXray(geoDesc.bones, gw, refs.filter(Boolean), visOf, (m) => console.warn(`[bb_ui] aviso: ${m}`));
+    geoOut['minecraft:geometry'][0].bones = flat.bones;
+    outBones = flat.bones;
+    mergedVis = flat.mergedVis;
   }
+  if (outBones.some((b) => b.name === YAW_BONE)) err(uiId, `el nombre de hueso "${YAW_BONE}" esta reservado`);
+  geoOut['minecraft:geometry'][0].bones = wrapYaw(geoOut['minecraft:geometry'][0].bones);
   writeEntityMaterials();
   writeJson(path.join(T_RP, `models/entity/bb_ui/${ID}.geo.json`), geoOut);
   mkdirp(path.join(T_RP, 'textures/bb_ui'));
@@ -554,20 +1060,31 @@ async function generateUi(uiId, ui, geo, ctx) {
   if (hasDigits) {
     writeJson(path.join(T_RP, `models/entity/bb_ui/${ID}_digits.geo.json`), buildDigitsGeo(ID, numberList, boneMap));
   }
+  // backdrop (+ calibration corners) in their own geometry/texture
+  const bdOpt = ui.display?.backdrop;
+  const backdrop = bdOpt === false ? null : { ...BACKDROP_DEFAULT, ...(isObj(bdOpt) ? bdOpt : {}) };
+  const hasBackdropGeo = !!backdrop || calibrate;
+  if (hasBackdropGeo) {
+    writeJson(path.join(T_RP, `models/entity/bb_ui/${ID}_backdrop.geo.json`),
+      buildBackdropGeo(ID, bbPx, centerY * 16, !!backdrop, calibrate));
+    writeBackdropTexture(path.join(T_RP, `textures/bb_ui/${ID}_backdrop.png`), backdrop || BACKDROP_DEFAULT);
+  }
 
   // ---- render controllers
-  const viewer = P('viewer');
   const partVis = [{ '*': viewer }];
-  for (const [bone, conds] of boneConds) {
-    const uniq = [...new Set(conds)];
-    const body = uniq.length === 1 ? uniq[0] : uniq.map((c) => `(${c})`).join(' || ');
-    partVis.push({ [bone]: `${viewer} && (${body})` });
+  for (const b of outBones) {
+    const e = mergedVis.has(b.name) ? mergedVis.get(b.name) : visOf(b.name);
+    if (e) partVis.push({ [b.name]: `${viewer} && ${e}` });
   }
+  const NO_TINT = { r: '0.0', g: '0.0', b: '0.0', a: '0.0' };
   const rcMain = {
     geometry: 'Geometry.default',
     materials: [{ '*': 'Material.default' }],
     textures: ['Texture.default'],
     ignore_lighting: true,
+    // no red hurt flash / fire tint: the display entity may take suffocation hits inside blocks (damage is ignored)
+    is_hurt_color: NO_TINT,
+    on_fire_color: NO_TINT,
     part_visibility: partVis,
   };
   const rcs = { [`controller.render.bb_ui.${ID}`]: rcMain };
@@ -587,7 +1104,22 @@ async function generateUi(uiId, ui, geo, ctx) {
       materials: [{ '*': 'Material.default' }],
       textures: ['Texture.digits'],
       ignore_lighting: true,
+      is_hurt_color: NO_TINT,
+      on_fire_color: NO_TINT,
       part_visibility: dv,
+    };
+  }
+  if (hasBackdropGeo) {
+    const bv = [{ '*': viewer }];
+    if (calibrate) bv.push({ calib: `${viewer} && ${P('calib')}` });
+    rcs[`controller.render.bb_ui.${ID}.backdrop`] = {
+      geometry: 'Geometry.backdrop',
+      materials: [{ '*': 'Material.backdrop' }, { calib: 'Material.calib' }], // corners ignore depth (the near backdrop would hide them)
+      textures: ['Texture.backdrop'],
+      ignore_lighting: true,
+      is_hurt_color: NO_TINT,
+      on_fire_color: NO_TINT,
+      part_visibility: bv,
     };
   }
   writeJson(path.join(T_RP, `render_controllers/bb_ui/${ID}.json`), {
@@ -599,7 +1131,9 @@ async function generateUi(uiId, ui, geo, ctx) {
   const anims = {};
   const animRefs = {};
   const animate = [];
+  const customFocus = new Set((plan?.list || []).filter((a) => a.kind === 'focus').map((a) => a.arg));
   for (const f of focusAnims) {
+    if (customFocus.has(f.bone)) continue; // replaced by focus.<bone> from animations.json
     const name = `focus_${f.s}_${f.i}`;
     const full = `animation.bb_ui.${ID}.${name}`;
     anims[full] = {
@@ -610,24 +1144,74 @@ async function generateUi(uiId, ui, geo, ctx) {
     animRefs[name] = full;
     animate.push({ [name]: `${P('screen')} == ${f.s} && ${P('focus')} == ${f.i}` });
   }
-  if (focusAnims.length) {
+  // body yaw is fixed at 0; the runtime sets NS:yaw per viewer (yaw toward the camera) and this turns the root bone.
+  // Bedrock bone rotation Y = +yaw (same sign as vanilla look_at, see CONTRACT 3). Runs always (the geometry is hidden anyway without viewer).
+  {
+    const full = `animation.bb_ui.${ID}.yaw`;
+    anims[full] = { loop: true, animation_length: 1, bones: { [YAW_BONE]: { rotation: [0, `${P('yaw')}`, 0] } } };
+    animRefs.yaw = full;
+    animate.push('yaw');
+  }
+  if (backdrop) {
+    // Bedrock bone position animation is in pixels (16 per block); Z uses the geo axis (only X is mirrored), and the UI
+    // faces the viewer along local -Z, so -Z = toward the camera. NS:bd = blocks from the entity origin to the camera - 0.08.
+    const name = 'backdrop';
+    const full = `animation.bb_ui.${ID}.${name}`;
+    anims[full] = {
+      loop: true,
+      animation_length: 1,
+      bones: { __bbui_backdrop: { position: [0, 0, `-${P('bd')} * 16`] } },
+    };
+    animRefs[name] = full;
+    animate.push({ [name]: viewer });
+  }
+  // authored animations (animations.json): wiring by role, see CONTRACT 3.1
+  for (const a of plan?.list || []) {
+    const full = `animation.bb_ui.${ID}.${a.S}`;
+    anims[full] = a.def;
+    animRefs[a.S] = full;
+    let expr;
+    if (a.kind === 'close') expr = `${viewer} && ${P('closing')}`;
+    else if (a.kind === 'screen') expr = `${viewer} && ${P('screen')} == ${screenIndex[a.arg]}`;
+    else if (a.kind === 'focus' || a.kind === 'press') {
+      const parts = [];
+      for (const f of focusAnims) {
+        if (f.bone !== a.arg) continue;
+        parts.push(a.kind === 'focus'
+          ? `(${P('screen')} == ${f.s} && ${P('focus')} == ${f.i})`
+          : `(${P('screen')} == ${f.s} && ${P('press')} == ${f.i + 1})`);
+      }
+      expr = parts.join(' || ');
+    } else expr = viewer; // idle, open and any other name
+    animate.push({ [a.S]: expr });
+  }
+  if (animate.length) {
     writeJson(path.join(T_RP, `animations/bb_ui/${ID}.animation.json`), { format_version: '1.8.0', animations: anims });
   }
 
   // ---- client entity
   const desc = {
     identifier: entityId,
+    // UI stays alphatest: alphablend parts get re-sorted by distance every frame and buttons vanish behind the pages (seen in game)
     materials: { default: xray ? 'bb_ui.xray' : 'bb_ui.flat' },
     textures: { default: `textures/bb_ui/${ID}` },
     geometry: { default: `geometry.bb_ui.${ID}` },
     render_controllers: [`controller.render.bb_ui.${ID}`],
   };
+  if (hasBackdropGeo) {
+    // first in the list: drawn before the UI
+    desc.materials.backdrop = 'bb_ui.backdrop';
+    desc.materials.calib = 'bb_ui.xray';
+    desc.textures.backdrop = `textures/bb_ui/${ID}_backdrop`;
+    desc.geometry.backdrop = `geometry.bb_ui.${ID}.backdrop`;
+    desc.render_controllers.unshift(`controller.render.bb_ui.${ID}.backdrop`);
+  }
   if (hasDigits) {
     desc.textures.digits = 'textures/bb_ui/digits';
     desc.geometry.digits = `geometry.bb_ui.${ID}.digits`;
     desc.render_controllers.push(`controller.render.bb_ui.${ID}.digits`);
   }
-  if (focusAnims.length) {
+  if (animate.length) {
     desc.animations = animRefs;
     desc.scripts = { animate };
   }
@@ -646,6 +1230,11 @@ async function generateUi(uiId, ui, geo, ctx) {
     numbers,
     conditions,
     bonePos,
+    centerY,
+    bbox,
+    closeTicks: plan?.closeTicks || 0,
+    pressTicks: plan?.pressTicks || 0,
+    pressBones: plan && plan.usesPress ? plan.list.filter((a) => a.kind === 'press').map((a) => a.arg) : [],
   };
   return { entry, hasDigits, langLines };
 }
@@ -749,7 +1338,7 @@ async function main() {
     return;
   }
   console.log('=== BB UI Filter ===');
-  const usedGlobal = { commands: new Set(), generated: new Set() };
+  const usedGlobal = { commands: new Set(), generated: new Set(), uiIds: new Set(dirs) };
   const loaded = [];
   for (const id of dirs) {
     const dir = path.join(DATA_DIR, id);
@@ -773,6 +1362,14 @@ async function main() {
     if (!geo) continue;
     const geoBones = new Set(geo['minecraft:geometry'][0].bones.map((b) => b.name));
     const ctx = validate(id, ui, geoBones, usedGlobal);
+    if (ctx) {
+      const animPath = path.join(dir, 'animations.json');
+      let animDoc = null;
+      if (fs.existsSync(animPath)) {
+        try { animDoc = JSON.parse(fs.readFileSync(animPath, 'utf8')); } catch (e) { err(id, `animations.json no es JSON valido: ${e.message}`); }
+      }
+      ctx.animPlan = planAnimations(id, ui, geoBones, animDoc, ctx.propCount);
+    }
     if (ctx) loaded.push({ id, ui, geo, ctx });
   }
   if (errors.length) {

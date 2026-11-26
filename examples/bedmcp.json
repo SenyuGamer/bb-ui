@@ -1,0 +1,9 @@
+{
+  "world": "worlds/TestWorld",
+  "serverProperties": { "gamemode": "creative" },
+  "behaviorPacks": ["dist/BP"],
+  "resourcePacks": ["dist/RP"],
+  "build": [
+    { "cmd": "regolith", "args": ["run", "build"], "cwd": "." }
+  ]
+}

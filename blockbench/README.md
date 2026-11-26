@@ -12,12 +12,14 @@ Hay que recargarlo tras editar el archivo.
 ## Flujo de trabajo
 
 1. File -> New -> **Minecraft UI**. Se crean los datos por defecto (id desde el nombre, namespace `bbui`, pantalla `main`).
+   Arriba a la derecha aparece un cuarto modo, **UI** (junto a Editar / Pintar / Animar): ahi estan los paneles UI Screens,
+   UI Element y UI Settings, con el outliner y las texturas. Modela en Editar y pinta en Pintar; todo lo de UI se hace en el modo UI.
 2. Menu **UI** (o el "+" del outliner): *Add Button / Image / Number / Model Slot*. Cada uno crea un grupo con un plano plano
    mirando al norte (-Z) y lo asigna a la pantalla activa. *Add Button* crea ademas `btn_N_hl` (resaltado, un poco mas grande y detras).
    Pinta la textura (unica) como siempre.
 3. Panel **UI Screens**: anade/renombra/elimina pantallas, elige la de inicio, activa una (oculta los huesos de las demas; "Mostrar todo"
    los enseña), `default_focus` y `actionbar`. *Preview navigation*: foco con flechas/Enter/Esc usando la misma regla que el runtime.
-4. Panel **UI Element** (con un grupo seleccionado): rol, pantalla, accion del boton (goto/back/close/command/script/set/add/sequence),
+4. Panel **UI Element** (con un grupo seleccionado): rol, pantalla, accion del boton (goto/back/close/command/script/set/add/open_ui/sequence),
    navegacion arriba/abajo/izquierda/derecha, highlight, `visible_if`, y query/digits/align para numeros.
 5. Panel **UI Settings**: id, namespace, display, metodos de apertura (item/block/entity/command, con `generate` opcional) y queries.
 6. **UI: Validate** y **UI: Export to pack**. La primera vez pide la carpeta `<tu proyecto Regolith>/packs/data/bb_ui` (se recuerda; "Set export folder" la cambia).

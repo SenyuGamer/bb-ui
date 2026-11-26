@@ -1,9 +1,9 @@
 // Focus navigation for BB UI.
 import { evalCondition } from "./queries.js";
 
-// Screen-right axis in model space. The entity faces the viewer (model front -Z toward the viewer), so the viewer's
-// right is model -X. Flip to 1 if left/right come out mirrored in game (needs in-game verification).
-export const MODEL_RIGHT_SIGN = -1;
+// Screen-right axis in model space. Verified in game: bones with negative X appear on the screen LEFT, so the
+// viewer's right is model +X.
+export const MODEL_RIGHT_SIGN = 1;
 
 const DIRS = { up: [0, 1], down: [0, -1], left: [-1, 0], right: [1, 0] };
 

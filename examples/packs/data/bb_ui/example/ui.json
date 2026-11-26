@@ -7,6 +7,7 @@
     "distance": 2.5,
     "height": 0,
     "anchor": "player",
+    "backdrop": { "color": "#120d0a", "opacity": 0.9 },
     "sounds": { "move": "random.click", "accept": "random.orb", "open": "random.pop", "close": "random.pop" }
   },
   "open": [

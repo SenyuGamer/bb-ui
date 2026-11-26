@@ -3,3 +3,9 @@ dist/
 node_modules/
 examples/dist
 *.ini
+examples/worlds
+.work/
+examples/packs/data/bb_ui/guide_book/
+
+# Referencia local (add-on de Marketplace): NO subir
+reference/

@@ -4,6 +4,7 @@ import {
     sessions, tickSessions, getSession, acceptFocus, exitPressed, closeSession,
     removeOrphans, removeEntitiesOf, dropSessionOnLeave,
 } from "./session.js";
+import { UI_REGISTRY } from "./generated/ui_registry.js";
 import { initOpen } from "./open.js";
 
 export * from "./api.js";
@@ -24,6 +25,15 @@ world.afterEvents.playerButtonInput.subscribe((ev) => {
         closeSession(s, "error");
     }
 });
+
+world.afterEvents.entityHurt.subscribe(
+    (ev) => {
+        try {
+            ev.hurtEntity.getComponent("minecraft:health")?.resetToMaxValue();
+        } catch {}
+    },
+    { entityTypes: [...new Set(Object.values(UI_REGISTRY).map((d) => d.entity))] },
+);
 
 world.beforeEvents.playerLeave.subscribe((ev) => dropSessionOnLeave(ev.player.id));
 

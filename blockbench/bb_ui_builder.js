@@ -17,7 +17,7 @@
     const ID_RE = /^[a-z0-9_]+$/;
     const NS_ID_RE = /^[a-z0-9_]+:[a-z0-9_]+$/;
     const OPS = ['==', '!=', '>', '>=', '<', '<='];
-    const ACTION_TYPES = ['goto', 'back', 'close', 'command', 'script', 'set', 'add', 'sequence'];
+    const ACTION_TYPES = ['goto', 'back', 'close', 'command', 'script', 'set', 'add', 'open_ui', 'sequence'];
     const ROLES = ['none', 'decor', 'button', 'image', 'model', 'number'];
     const DIRS = ['up', 'down', 'left', 'right'];
 
@@ -80,6 +80,24 @@
         s.elements.push(el);
         if (role === 'button' && !s.default_focus) core.set(s, 'default_focus', bone);
         return el;
+    };
+
+    // Rename a bone everywhere it is referenced. Returns the number of references changed.
+    core.renameBone = function (data, from, to) {
+        if (!data || !from || !to || from === to) return 0;
+        let n = 0;
+        const sw = (v) => { if (v === from) { n++; return to; } return v; };
+        for (const s of data.screens || []) {
+            if (Array.isArray(s.bones)) s.bones.forEach((b, i) => { s.bones[i] = sw(b); });
+            if (s.default_focus === from) s.default_focus = sw(s.default_focus);
+            for (const e of s.elements || []) {
+                if (e.bone === from) e.bone = sw(e.bone);
+                if (e.highlight === from) e.highlight = sw(e.highlight);
+                if (e.nav) for (const d of DIRS) if (e.nav[d] === from) e.nav[d] = sw(e.nav[d]);
+                for (const a of core.actionsOf(e.action)) if (a.bone === from) a.bone = sw(a.bone);
+            }
+        }
+        return n;
     };
 
     core.renameScreen = function (data, oldId, newId) {
@@ -194,6 +212,11 @@
                         if (a.type === 'script' && !String(a.fn || '').trim()) E(w + ': script sin fn.');
                         if ((a.type === 'set' || a.type === 'add') && !String(a.key || '').trim()) E(w + ': ' + a.type + ' sin key.');
                         if (a.type === 'add' && typeof a.amount !== 'number') E(w + ': add sin amount numerico.');
+                        if (a.type === 'open_ui') {
+                            if (!String(a.ui || '').trim()) E(w + ': open_ui sin ui.');
+                            else if (!ID_RE.test(a.ui)) E(w + ': open_ui con id invalido "' + a.ui + '" (usa [a-z0-9_]+).');
+                            else if (a.ui === data.id) W(w + ': open_ui apunta a esta misma UI.');
+                        }
                         if (a.type === 'sequence' && !(a.actions || []).length) W(w + ': sequence vacia.');
                     }
                 }
@@ -244,8 +267,12 @@
     core.set = (o, k, v) => Vue.set(o, k, v);
     core.del = (o, k) => Vue.delete(o, k);
 
-    const state = { data: null, activeScreen: '', showAll: false, sel: '', rev: 0, groups: [], preview: { on: false, focus: '', stack: [] } };
-    let panels = [], actions = [], listeners = [], styleEl = null, formatObj = null, pollTimer = null, keyHandler = null;
+    const state = { data: null, activeScreen: '', showAll: false, safe: false, sel: '', rev: 0, groups: [], profile: 'default', building: false, preview: { on: false, focus: '', stack: [] } };
+    const MODE_ID = 'bb_ui_mode';
+    // Built-in panels that also show in the UI mode (to select bones and paint): their condition gets MODE_ID while loaded.
+    const SHARED_PANELS = ['outliner', 'textures'];
+    let panels = [], actions = [], listeners = [], styleEl = null, formatObj = null, pollTimer = null, keyHandler = null, modeObj = null;
+    const patchedPanels = [];
     const menus = [];
 
     const isUi = () => typeof Format !== 'undefined' && Format && Format.id === FORMAT_ID && typeof Project !== 'undefined' && Project;
@@ -286,22 +313,36 @@
     function applyVisibility() {
         const d = getData();
         if (!d) return;
+        // a bone may belong to several screens (shared buttons like the page arrows)
         const owner = {};
+        const add = (b, id) => { (owner[b] = owner[b] || new Set()).add(id); };
         for (const s of d.screens) {
-            for (const b of s.bones || []) owner[b] = s.id;
-            for (const e of s.elements || []) { owner[e.bone] = s.id; if (e.highlight) owner[e.highlight] = s.id; }
+            for (const b of s.bones || []) add(b, s.id);
+            for (const e of s.elements || []) { add(e.bone, s.id); if (e.highlight) add(e.highlight, s.id); }
         }
         for (const g of Group.all || []) {
             const o = owner[g.name];
-            g.visibility = state.showAll || !o || o === state.activeScreen;
+            g.visibility = state.showAll || !o || o.has(state.activeScreen);
+        }
+        // Blockbench does not hide a group's cubes with the group: propagate to every cube from its ancestors.
+        for (const c of Cube.all || []) {
+            let v = true;
+            for (let p = c.parent; p && p !== 'root' && p instanceof Group; p = p.parent) if (p.visibility === false) { v = false; break; }
+            c.visibility = v;
         }
         try { Canvas.updateVisibility(); } catch (e) {}
         try { Canvas.updateAllBones(); } catch (e) {}
     }
     function showAllTemporarily(fn) {
-        const prev = (Group.all || []).map((g) => [g, g.visibility]);
-        for (const [g] of prev) g.visibility = true;
-        try { return fn(); } finally { for (const [g, v] of prev) g.visibility = v; try { Canvas.updateVisibility(); } catch (e) {} }
+        const prevG = (Group.all || []).map((g) => [g, g.visibility]);
+        const prevC = (Cube.all || []).map((c) => [c, c.visibility]);
+        for (const [g] of prevG) g.visibility = true;
+        for (const [c] of prevC) c.visibility = true;
+        try { return fn(); } finally {
+            for (const [g, v] of prevG) g.visibility = v;
+            for (const [c, v] of prevC) c.visibility = v;
+            try { Canvas.updateVisibility(); } catch (e) {}
+        }
     }
 
     // ------------------------------------------------------------------ preview navigation
@@ -364,14 +405,21 @@
         return prefix + '_' + n;
     }
     // Flat plane facing -Z (north face). Viewer is on the -Z side; "behind" = larger Z.
-    function flatGroup(name, cx, cy, z, w, h) {
+    // uv = [u0,v0,u1,v1] in TEXTURE PIXELS (defaults to [0,0,w,h]); parent = Group to nest the new group in.
+    function mainTexture() { try { return (Texture.getDefault && Texture.getDefault()) || Texture.all[0] || null; } catch (e) { return null; } }
+    function uvScale(tex) { return tex && tex.width && tex.uv_width ? tex.uv_width / tex.width : 1; }
+    function flatGroup(name, cx, cy, z, w, h, uv, parent) {
         const group = new Group({ name, origin: [cx, cy, z] }).init();
+        if (parent) group.addTo(parent);
         const cube = new Cube({ name: name + '_plane', from: [cx - w / 2, cy - h / 2, z], to: [cx + w / 2, cy + h / 2, z] });
         try { cube.box_uv = false; } catch (e) {}
         cube.init();
         cube.addTo(group);
         try {
-            cube.faces.north.uv = [0, 0, w, h];
+            const tex = mainTexture(), k = uvScale(tex);
+            const u = uv || [0, 0, w, h];
+            cube.faces.north.uv = u.map((n) => n * k);
+            if (tex) cube.faces.north.texture = tex.uuid;
             for (const f of ['south', 'east', 'west', 'up', 'down']) cube.faces[f].uv = [0, 0, 0, 0];
         } catch (e) {}
         return { group, cube };
@@ -386,30 +434,404 @@
         const name = nextName(prefix);
         const used = (screen.elements || []).length + (screen.bones || []).length;
         const [w, h] = SIZES[kind];
-        const y = 14 - 6 * (used % 3);
-        const x = -Math.floor(used / 3) * 10;
+        const at = placement(screen, null);
+        const x = at.x, y = at.y;
         const groups = [], cubes = [];
         Undo.initEdit({ outliner: true, elements: [], groups: [] });
-        const main = flatGroup(name, x, y, -0.4, w, h);
+        const main = flatGroup(name, x, y, at.z, w, h);
         groups.push(main.group); cubes.push(main.cube);
         let hlName = '';
         if (kind === 'button') {
             hlName = name + '_hl';
-            const hl = flatGroup(hlName, x, y, -0.2, w + 1.5, h + 1.5);
+            const hl = flatGroup(hlName, x, y, at.z + 0.2, w + 1.5, h + 1.5);
             groups.push(hl.group); cubes.push(hl.cube);
         }
         Undo.finishEdit('Add UI ' + kind, { outliner: true, elements: cubes, groups });
+        try { Canvas.updateAll(); } catch (e) {}
         const el = core.assignBone(d, screen.id, name, kind, Object.keys(d.queries));
         if (el && hlName) core.set(el, 'highlight', hlName);
         touch();
         applyVisibility();
+        applyRoleColors();
         try { main.group.select(); } catch (e) {}
         syncState();
         return name;
     }
 
+    // ------------------------------------------------------------------ placement helpers
+    function selectedGroup() { try { return Group.first_selected || null; } catch (e) { return null; } }
+    // Where a new element goes: inside the selected group (at its origin, a bit in front) or stacked at the root.
+    function placement(screen, parent) {
+        if (parent && parent.origin) return { x: parent.origin[0], y: parent.origin[1], z: parent.origin[2] - 0.2 };
+        const used = (screen.elements || []).length + (screen.bones || []).length;
+        // centre of what is visible now (world space), just in front of it, staggered so new items don't stack
+        const b = cubeBounds();
+        if (b) {
+            const k = used % 6;
+            return { x: (b.mn[0] + b.mx[0]) / 2 + (k % 3 - 1) * 3, y: (b.mn[1] + b.mx[1]) / 2 + (1 - Math.floor(k / 3)) * 3, z: b.mn[2] - 0.4 };
+        }
+        return { x: -Math.floor(used / 3) * 10, y: 14 - 6 * (used % 3), z: -0.4 };
+    }
+    function finishNewElement(d, screen, name, group, role) {
+        core.assignBone(d, screen.id, name, role, Object.keys(d.queries));
+        touch();
+        try { Canvas.updateAll(); } catch (e) {} // new cubes need their meshes/UVs built before they show
+        applyVisibility();
+        applyRoleColors();
+        try { group.select(); } catch (e) {}
+        syncState();
+    }
+    function needProject() {
+        const d = ensureData();
+        if (!d) throw new Error('Abre un proyecto "Minecraft UI".');
+        syncState();
+        return d;
+    }
+
+    // ------------------------------------------------------------------ Add Image (texture rectangle picker)
+    // opts = { uv: [u0,v0,u1,v1] (texture pixels), height (model units), name? }
+    function addImage(opts) {
+        const d = needProject();
+        const screen = core.getScreen(d, state.activeScreen);
+        const uv = (opts.uv || []).map((n) => Math.round(n));
+        const uw = uv[2] - uv[0], vh = uv[3] - uv[1];
+        if (!(uw > 0 && vh > 0)) throw new Error('Rectangulo de UV vacio.');
+        const h = opts.height > 0 ? opts.height : vh;
+        const w = h * uw / vh;
+        const parent = selectedGroup();
+        const name = opts.name && !boneNames().includes(opts.name) ? opts.name : nextName('img');
+        const p = placement(screen, parent);
+        Undo.initEdit({ outliner: true, elements: [], groups: [] });
+        const q = flatGroup(name, p.x, p.y, p.z, w, h, uv, parent);
+        Undo.finishEdit('Add UI image', { outliner: true, elements: [q.cube], groups: [q.group] });
+        finishNewElement(d, screen, name, q.group, 'image');
+        return name;
+    }
+    function textureImageSource(tex) { return tex ? (tex.img && tex.img.naturalWidth ? tex.img : tex.canvas) : null; }
+
+    function imageDialog() {
+        needProject();
+        const tex = mainTexture();
+        if (!tex || !tex.width) throw new Error('El proyecto no tiene textura.');
+        const tw = tex.width, th = tex.height;
+        const pk = { zoom: Math.max(1, Math.min(32, Math.floor(480 / tw))), u0: 0, v0: 0, u1: Math.min(8, tw), v1: Math.min(8, th), height: 8, name: '', drag: null };
+        const component = {
+            data() { return { pk }; },
+            computed: {
+                width() { const vh = this.pk.v1 - this.pk.v0, uw = this.pk.u1 - this.pk.u0; return vh > 0 ? Math.round(this.pk.height * uw / vh * 100) / 100 : 0; },
+            },
+            mounted() { this.$nextTick(() => this.draw()); },
+            watch: { 'pk.zoom'() { this.$nextTick(() => this.draw()); } },
+            methods: {
+                draw() {
+                    const cv = this.$refs.cv;
+                    if (!cv) return;
+                    const z = this.pk.zoom;
+                    cv.width = tw * z; cv.height = th * z;
+                    const c = cv.getContext('2d');
+                    c.imageSmoothingEnabled = false;
+                    const sq = Math.max(4, Math.min(z, 8));
+                    for (let y = 0; y < cv.height; y += sq) for (let x = 0; x < cv.width; x += sq) { c.fillStyle = ((x / sq + y / sq) & 1) ? '#555' : '#777'; c.fillRect(x, y, sq, sq); }
+                    const src = textureImageSource(tex);
+                    if (src) c.drawImage(src, 0, 0, tw * z, th * z);
+                    const p = this.pk;
+                    c.fillStyle = 'rgba(255,210,60,0.25)';
+                    c.fillRect(p.u0 * z, p.v0 * z, (p.u1 - p.u0) * z, (p.v1 - p.v0) * z);
+                    c.strokeStyle = '#ffd23c'; c.lineWidth = 2;
+                    c.strokeRect(p.u0 * z + 1, p.v0 * z + 1, (p.u1 - p.u0) * z - 2, (p.v1 - p.v0) * z - 2);
+                },
+                px(e) {
+                    const r = this.$refs.cv.getBoundingClientRect(), z = this.pk.zoom;
+                    return [Math.max(0, Math.min(tw - 1, Math.floor((e.clientX - r.left) / z))), Math.max(0, Math.min(th - 1, Math.floor((e.clientY - r.top) / z)))];
+                },
+                rect(a, b) {
+                    const p = this.pk;
+                    p.u0 = Math.min(a[0], b[0]); p.v0 = Math.min(a[1], b[1]);
+                    p.u1 = Math.max(a[0], b[0]) + 1; p.v1 = Math.max(a[1], b[1]) + 1;
+                    this.draw();
+                },
+                down(e) { this.pk.drag = this.px(e); this.rect(this.pk.drag, this.pk.drag); },
+                move(e) { if (this.pk.drag) this.rect(this.pk.drag, this.px(e)); },
+                up() { this.pk.drag = null; },
+                wheel(e) { this.pk.zoom = Math.max(1, Math.min(48, this.pk.zoom + (e.deltaY < 0 ? 1 : -1))); },
+                num(k, v) {
+                    const p = this.pk, n = Math.round(Number(v) || 0);
+                    p[k] = k[0] === 'u' ? Math.max(0, Math.min(tw, n)) : Math.max(0, Math.min(th, n));
+                    this.draw();
+                },
+            },
+            template: '<div class="bbui-picker">' +
+                '<div class="bbui-row"><label>Zoom</label><input type="range" min="1" max="48" v-model.number="pk.zoom"><span>{{pk.zoom}}x</span></div>' +
+                '<div class="bbui-pkwrap"><canvas ref="cv" @mousedown.prevent="down" @mousemove="move" @mouseup="up" @mouseleave="up" @wheel.prevent="wheel"></canvas></div>' +
+                '<div class="bbui-row"><label>UV (px)</label>' +
+                '<input type="number" :value="pk.u0" @change="num(\'u0\', $event.target.value)"><input type="number" :value="pk.v0" @change="num(\'v0\', $event.target.value)">' +
+                '<input type="number" :value="pk.u1" @change="num(\'u1\', $event.target.value)"><input type="number" :value="pk.v1" @change="num(\'v1\', $event.target.value)"></div>' +
+                '<div class="bbui-row"><label>Alto</label><input type="number" min="0.5" step="0.5" v-model.number="pk.height"><span>ancho = {{width}}</span></div>' +
+                '<div class="bbui-row"><label>Nombre</label><input type="text" v-model="pk.name" placeholder="(auto)"></div></div>',
+        };
+        const dlg = new Dialog({
+            id: 'bb_ui_add_image', title: 'UI: Add Image', width: 640, component,
+            buttons: ['Add', 'Cancel'], confirmIndex: 0, cancelIndex: 1,
+            onConfirm() {
+                try { addImage({ uv: [pk.u0, pk.v0, pk.u1, pk.v1], height: pk.height, name: pk.name }); }
+                catch (e) { Blockbench.showMessageBox({ title: 'UI: Add Image', message: esc(e.message), icon: 'error' }); return false; }
+            },
+        });
+        dlg.show();
+        return dlg;
+    }
+
+    // ------------------------------------------------------------------ Fonts and text
+    // Project.bbui.fonts = { name: { glyphs: { "<char>": [u0,v0,u1,v1] (texture px) }, size: [w,h] and advance in BLOCKS }  (editor-only, never in ui.json)
+    function addFont(o) {
+        const d = needProject();
+        const tex = mainTexture();
+        if (!tex || !tex.width) throw new Error('El proyecto no tiene textura.');
+        const name = String(o.name || '').trim().replace(/[^A-Za-z0-9_]+/g, '_');
+        if (!name) throw new Error('Nombre de fuente vacio.');
+        const cw = Math.round(o.cw), chh = Math.round(o.ch), x0 = Math.round(o.x || 0), y0 = Math.round(o.y || 0);
+        if (!(cw > 0 && chh > 0)) throw new Error('Tamano de celda invalido.');
+        const chars = Array.from(String(o.chars || '').replace(/[\r\n]/g, ''));
+        if (!chars.length) throw new Error('Sin caracteres.');
+        const cols = Math.round(o.cols) > 0 ? Math.round(o.cols) : Math.max(1, Math.floor((tex.width - x0) / cw));
+        const glyphs = {};
+        chars.forEach((c, i) => {
+            if (c === ' ') return;
+            const u0 = x0 + (i % cols) * cw, v0 = y0 + Math.floor(i / cols) * chh;
+            if (u0 + cw > tex.width || v0 + chh > tex.height) throw new Error('El caracter "' + c + '" (#' + (i + 1) + ') cae fuera de la textura (' + tex.width + 'x' + tex.height + ').');
+            glyphs[c] = [u0, v0, u0 + cw, v0 + chh];
+        });
+        if (!d.fonts) core.set(d, 'fonts', {});
+        core.set(d.fonts, name, { glyphs, size: [cw, chh], advance: o.advance > 0 ? o.advance : 0 }); // model units (1 texture px = 1 model unit)
+        touch();
+        return name;
+    }
+    function removeFont(name) { const d = getData(); if (d && d.fonts) { core.del(d.fonts, name); touch(); } }
+
+    // Pure layout in model units at scale 1 (screen space: x right, y down, relative to the top-left of the block).
+    // font.size = [w,h] of the largest glyph and font.advance = pen step, both in MODEL UNITS; glyph rects are texture pixels
+    // (inverted rects are normalised). Glyph quads are scaled so the largest glyph measures font.size.
+    core.layoutText = function (font, text, align) {
+        const norm = (g) => [Math.min(g[0], g[2]), Math.min(g[1], g[3]), Math.max(g[0], g[2]), Math.max(g[1], g[3])];
+        let refW = 0, refH = 0;
+        for (const g of Object.values(font.glyphs || {})) { const n = norm(g); refW = Math.max(refW, n[2] - n[0]); refH = Math.max(refH, n[3] - n[1]); }
+        refW = refW || 8; refH = refH || 8;
+        // font.size / font.advance are MODEL UNITS (pixels of the model), like every other coordinate in the UI;
+        // without a size, one texture pixel = one model unit
+        const sz = font.size && font.size[0] > 0 && font.size[1] > 0 ? font.size : [refW, refH];
+        const kx = sz[0] / refW, ky = sz[1] / refH;
+        const adv = font.advance > 0 ? font.advance : 0;
+        const lineH = sz[1] * 1.25;
+        const lines = String(text).split('\n').map((ln) => {
+            let pen = 0, right = 0;
+            const items = [];
+            for (const ch of Array.from(ln)) {
+                const g = font.glyphs[ch] && norm(font.glyphs[ch]);
+                if (g) { const w = (g[2] - g[0]) * kx; items.push({ ch, x: pen, w, h: (g[3] - g[1]) * ky, uv: g }); right = pen + w; }
+                pen += adv || (g ? (g[2] - g[0]) * kx + kx : sz[0]);
+            }
+            return { items, width: right };
+        });
+        const W = Math.max(0, ...lines.map((l) => l.width));
+        const out = [];
+        lines.forEach((l, r) => {
+            const off = align === 'right' ? W - l.width : align === 'center' ? (W - l.width) / 2 : 0;
+            for (const it of l.items) out.push({ ch: it.ch, x: it.x + off, y: r * lineH, w: it.w, h: it.h, uv: it.uv });
+        });
+        return { glyphs: out, width: W, height: lines.length * lineH };
+    };
+
+    // opts = { text, font, scale (model units per texture px), align: left|center|right, name? }
+    function addText(opts) {
+        const d = needProject();
+        const font = d.fonts && d.fonts[opts.font];
+        if (!font) throw new Error('Fuente "' + opts.font + '" no definida.');
+        const text = String(opts.text || '');
+        if (!text.trim()) throw new Error('Texto vacio.');
+        const scale = opts.scale > 0 ? opts.scale : 1;
+        const lay = core.layoutText(font, text, opts.align || 'left');
+        if (!lay.glyphs.length) throw new Error('Ningun caracter del texto existe en la fuente.');
+        const screen = core.getScreen(d, state.activeScreen);
+        const parent = selectedGroup();
+        const name = opts.name && !boneNames().includes(opts.name) ? opts.name : nextName('txt');
+        const p = placement(screen, parent);
+        const tex = mainTexture(), k = uvScale(tex);
+        const W = lay.width * scale, H = lay.height * scale;
+        const cubes = [];
+        Undo.initEdit({ outliner: true, elements: [], groups: [] });
+        const group = new Group({ name, origin: [p.x, p.y, p.z] }).init();
+        if (parent) group.addTo(parent);
+        lay.glyphs.forEach((g, i) => {
+            const xl = p.x + W / 2 - g.x * scale; // screen-left = model +X
+            const yt = p.y + H / 2 - g.y * scale;
+            const cube = new Cube({ name: name + '_' + (i + 1), from: [xl - g.w * scale, yt - g.h * scale, p.z], to: [xl, yt, p.z] });
+            try { cube.box_uv = false; } catch (e) {}
+            cube.init();
+            cube.addTo(group);
+            try {
+                cube.faces.north.uv = g.uv.map((n) => n * k);
+                if (tex) cube.faces.north.texture = tex.uuid;
+                for (const f of ['south', 'east', 'west', 'up', 'down']) cube.faces[f].uv = [0, 0, 0, 0];
+            } catch (e) {}
+            cubes.push(cube);
+        });
+        Undo.finishEdit('Add UI text', { outliner: true, elements: cubes, groups: [group] });
+        finishNewElement(d, screen, name, group, 'image');
+        return name;
+    }
+
+    function textDialog() {
+        const d = needProject();
+        const fonts = Object.keys(d.fonts || {});
+        if (!fonts.length) throw new Error('No hay fuentes: crea una en UI Settings -> Fonts (o menu UI: Create Font).');
+        new Dialog({
+            id: 'bb_ui_add_text', title: 'UI: Add Text', width: 480,
+            form: {
+                text: { label: 'Texto', type: 'textarea', value: 'Hello' },
+                font: { label: 'Fuente', type: 'select', options: Object.fromEntries(fonts.map((f) => [f, f])), value: fonts[0] },
+                scale: { label: 'Escala (unidades por pixel)', type: 'number', value: 1, min: 0.05, step: 0.05 },
+                align: { label: 'Alineacion', type: 'select', options: { left: 'left', center: 'center', right: 'right' }, value: 'center' },
+            },
+            onConfirm(f) {
+                try { addText({ text: f.text, font: f.font, scale: f.scale, align: f.align }); }
+                catch (e) { Blockbench.showMessageBox({ title: 'UI: Add Text', message: esc(e.message), icon: 'error' }); return false; }
+            },
+        }).show();
+    }
+    function fontDialog() {
+        needProject();
+        new Dialog({
+            id: 'bb_ui_add_font', title: 'UI: Create Font', width: 520,
+            form: {
+                name: { label: 'Nombre', type: 'text', value: 'main' },
+                x: { label: 'Inicio X (px)', type: 'number', value: 0, min: 0 },
+                y: { label: 'Inicio Y (px)', type: 'number', value: 0, min: 0 },
+                cw: { label: 'Celda ancho (px)', type: 'number', value: 8, min: 1 },
+                ch: { label: 'Celda alto (px)', type: 'number', value: 8, min: 1 },
+                cols: { label: 'Columnas (0 = hasta el borde)', type: 'number', value: 0, min: 0 },
+                advance: { label: 'Avance (px, 0 = ancho del glifo + 1)', type: 'number', value: 0, min: 0 },
+                chars: { label: 'Caracteres (fila a fila; un espacio deja la celda vacia)', type: 'textarea', value: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789' },
+            },
+            onConfirm(f) {
+                try { addFont(f); Blockbench.showQuickMessage('Fuente "' + f.name + '" creada', 1500); }
+                catch (e) { Blockbench.showMessageBox({ title: 'UI: Create Font', message: esc(e.message), icon: 'error' }); return false; }
+            },
+        }).show();
+    }
+
+    // ------------------------------------------------------------------ role colours (outliner)
+    const ROLE_COLOR = { button: 6, image: 5, number: 1, model: 4, decor: 9, highlight: 8 };
+    let colorSig = '';
+    function applyRoleColors() {
+        const d = getData();
+        if (!d) return;
+        const role = {};
+        for (const s of d.screens || []) {
+            for (const b of s.bones || []) role[b] = 'decor';
+            for (const e of s.elements || []) { role[e.bone] = e.type; if (e.highlight) role[e.highlight] = 'highlight'; }
+        }
+        for (const g of Group.all || []) {
+            const r = role[g.name];
+            if (r) { const c = ROLE_COLOR[r]; if (g.color !== c) g.color = c; g.bbui_colored = true; }
+            else if (g.bbui_colored) { g.color = 0; g.bbui_colored = false; }
+        }
+    }
+
+    // ------------------------------------------------------------------ rename tracking
+    const nameMaps = new WeakMap();
+    function trackRenames() {
+        const d = getData();
+        if (!d) return;
+        let m = nameMaps.get(Project);
+        const first = !m;
+        if (first) { m = new Map(); nameMaps.set(Project, m); }
+        const alive = new Set();
+        for (const g of Group.all || []) {
+            alive.add(g.uuid);
+            const old = m.get(g.uuid);
+            if (!first && old !== undefined && old !== g.name) {
+                if (core.renameBone(d, old, g.name)) touch();
+                if (state.preview.focus === old) state.preview.focus = g.name;
+                colorSig = '';
+            }
+            m.set(g.uuid, g.name);
+        }
+        for (const k of Array.from(m.keys())) if (!alive.has(k)) m.delete(k);
+    }
+
+    // ------------------------------------------------------------------ texture UV space (face UVs are TEXTURE PIXELS)
+    const pendingTex = [];
+    function onAddTexture(e) { const t = e && (e.texture || e); if (t && isUi()) pendingTex.push({ tex: t, at: Date.now() }); }
+    function processTextures() {
+        for (let i = pendingTex.length - 1; i >= 0; i--) {
+            const { tex, at } = pendingTex[i];
+            if (Date.now() - at < 700) continue;
+            if (!tex.width) { if (Date.now() - at > 8000) pendingTex.splice(i, 1); continue; }
+            pendingTex.splice(i, 1);
+            let used = false;
+            try { for (const c of Cube.all) for (const f in c.faces) if (c.faces[f].texture === tex.uuid && (c.faces[f].uv || []).some((n) => n)) used = true; } catch (er) {}
+            if (!used && (tex.uv_width !== tex.width || tex.uv_height !== tex.height)) { tex.uv_width = tex.width; tex.uv_height = tex.height; }
+        }
+    }
+
+    // ------------------------------------------------------------------ safe-zone guide (three.js overlay, never exported)
+    let safeObj = null, safeKey = '';
+    function removeSafe() {
+        if (!safeObj) return;
+        try { Canvas.scene.remove(safeObj); safeObj.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); }); } catch (e) {}
+        safeObj = null; safeKey = '';
+        try { Preview.all.forEach((p) => p.render()); } catch (e) {}
+    }
+    // Bounds of every cube (model units), used as the "UI centre".
+    function cubeBounds() {
+        // world-space bounds of the rendered cubes (honours rotated/nested groups, e.g. a book rotated to face -Z)
+        const box = new THREE.Box3();
+        let any = false;
+        for (const c of Cube.all || []) {
+            if (!c.mesh || c.visibility === false) continue;
+            try { c.mesh.updateMatrixWorld(true); box.expandByObject(c.mesh); any = true; } catch (e) {}
+        }
+        if (!any || box.isEmpty()) return null;
+        return { mn: [box.min.x, box.min.y, box.min.z], mx: [box.max.x, box.max.y, box.max.z] };
+    }
+    function safeZone() {
+        const d = getData();
+        if (!state.safe || !d) return removeSafe();
+        const b = cubeBounds();
+        if (!b) return removeSafe();
+        const disp = d.display || {};
+        const fov = disp.fov > 0 && disp.fov < 180 ? disp.fov : 70, dist = disp.distance > 0 ? disp.distance : 2.5, hgt = disp.height || 0;
+        const key = JSON.stringify([fov, dist, hgt, b.mn, b.mx]);
+        if (safeObj && key === safeKey) return;
+        removeSafe();
+        const H = 2 * dist * Math.tan(fov * Math.PI / 360) * 16, W = H * 16 / 9;
+        const cx = (b.mn[0] + b.mx[0]) / 2, cy = (b.mn[1] + b.mx[1]) / 2 - hgt * 16, z = b.mn[2] - 0.5; // just in front of the UI (it faces -Z)
+        const pts = [];
+        const rect = (w, h) => {
+            const x0 = cx - w / 2, x1 = cx + w / 2, y0 = cy - h / 2, y1 = cy + h / 2;
+            pts.push(x0, y0, z, x1, y0, z, x1, y0, z, x1, y1, z, x1, y1, z, x0, y1, z, x0, y1, z, x0, y0, z);
+        };
+        rect(W, H);
+        rect(W * 0.9, H * 0.9);
+        pts.push(cx - 2, cy, z, cx + 2, cy, z, cx, cy - 2, z, cx, cy + 2, z);
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+        const obj = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: 0xffd23c, depthTest: false, transparent: true }));
+        obj.renderOrder = 999;
+        obj.frustumCulled = false;
+        safeObj = new THREE.Group();
+        safeObj.name = 'bb_ui_safe_zone';
+        safeObj.add(obj);
+        safeObj.bbui_info = { width: W, height: H, cx, cy };
+        Canvas.scene.add(safeObj);
+        safeKey = key;
+        try { Preview.all.forEach((p) => p.render()); } catch (e) {}
+    }
+    function setSafe(on) { state.safe = !!on; safeZone(); }
+
     // ------------------------------------------------------------------ validate / export
-    function validate() { return core.validate(getData(), boneNames()); }
+    function exportedBoneNames() { try { return (Group.all || []).filter((g) => g.export !== false).map((g) => g.name); } catch (e) { return []; } }
+    function validate() { return core.validate(getData(), exportedBoneNames()); }
     function showValidation(res, title) {
         const lines = [];
         res.errors.forEach((m) => lines.push('<b>Error:</b> ' + esc(m)));
@@ -456,10 +878,17 @@
         const geo = toObject(showAllTemporarily(() => Codecs.bedrock.compile()));
         const geos = geo['minecraft:geometry'];
         if (!Array.isArray(geos) || geos.length !== 1) throw new Error('geo.json debe tener exactamente una geometria (tiene ' + (geos ? geos.length : 0) + ').');
-        fs.writeFileSync(dir + '/geo.json', JSON.stringify(geo, null, 2));
-
-        const tex = (typeof Texture !== 'undefined' && Texture.all && Texture.all[0]) || null;
+        // the Bedrock codec ignores the group "Export" toggle: drop those groups and everything under them
+        const skip = new Set();
+        for (const g of Group.all || []) {
+            for (let p = g; p instanceof Group; p = p.parent) if (p.export === false) { skip.add(g.name); break; }
+        }
+        if (skip.size) geos[0].bones = (geos[0].bones || []).filter((b) => !skip.has(b.name));
+        const tex = mainTexture();
         if (!tex) throw new Error('El proyecto no tiene textura.');
+        geoToTexturePixels(geos[0], tex);
+        fs.writeFileSync(dir + '/geo.json', JSON.stringify(geo, null, 2));
+        const files = ['ui.json', 'geo.json', 'texture.png'];
         let b64 = '';
         try { b64 = tex.getBase64(); } catch (e) {}
         if (!b64 && tex.canvas) b64 = tex.canvas.toDataURL('image/png');
@@ -467,10 +896,40 @@
         if (!b64) throw new Error('No se pudo leer la textura.');
         fs.writeFileSync(dir + '/texture.png', Buffer.from(b64, 'base64'));
 
-        fs.writeFileSync(dir + '/ui.json', JSON.stringify(clone(d), null, 2));
+        // fonts are editor-only data: they stay in the .bbmodel (key bbui), never in ui.json
+        const ui = clone(d);
+        delete ui.fonts;
+        fs.writeFileSync(dir + '/ui.json', JSON.stringify(ui, null, 2));
+
+        // Bedrock animations (same codec as File > Export > Bedrock animations), only when the project has some
+        try {
+            const anims = (typeof Animation !== 'undefined' && Animation.all) ? Animation.all.slice() : [];
+            const animFile = dir + '/animations.json';
+            if (anims.length) {
+                fs.writeFileSync(animFile, typeof AnimationCodec !== 'undefined' ? toJsonText(AnimationCodec.codecs.bedrock.compileFile(anims)) : '{}');
+                files.push('animations.json');
+            } else if (fs.existsSync(animFile)) fs.unlinkSync(animFile);
+        } catch (e) { res.warnings.push('animations.json no se pudo escribir: ' + e.message); }
+
         const proj = Codecs.project.compile();
         fs.writeFileSync(dir + '/model.bbmodel', typeof proj === 'string' ? proj : JSON.stringify(proj));
-        return { dir, files: ['ui.json', 'geo.json', 'texture.png', 'model.bbmodel'], warnings: res.warnings };
+        files.push('model.bbmodel');
+        return { dir, files, warnings: res.warnings };
+    }
+    function toJsonText(v) { return typeof v === 'string' ? v : JSON.stringify(v, null, 2); }
+    // Make geo UVs and texture_width/height refer to the real texture size (face UVs are texture pixels).
+    function geoToTexturePixels(g, tex) {
+        const desc = g.description || {};
+        const from = desc.texture_width || Project.texture_width || tex.width;
+        const fromH = desc.texture_height || Project.texture_height || tex.height;
+        const sx = tex.width / from, sy = tex.height / fromH;
+        desc.texture_width = tex.width; desc.texture_height = tex.height;
+        if (sx === 1 && sy === 1) return;
+        const sc = (a) => Array.isArray(a) ? [a[0] * sx, a[1] * sy].concat(a.slice(2)) : a;
+        for (const b of g.bones || []) for (const c of b.cubes || []) {
+            if (Array.isArray(c.uv)) c.uv = sc(c.uv);
+            else if (c.uv) for (const f of Object.keys(c.uv)) { const fc = c.uv[f]; if (fc.uv) fc.uv = sc(fc.uv); if (fc.uv_size) fc.uv_size = sc(fc.uv_size); }
+        }
     }
     function exportAction() {
         try {
@@ -482,6 +941,85 @@
             if (e.validation) showValidation(e.validation, 'Exportar UI: corrige esto primero');
             else Blockbench.showMessageBox({ title: 'Exportar UI', message: esc(e.message), icon: 'error' });
         }
+    }
+
+
+    // ------------------------------------------------------------------ Export & Build (regolith run <profile>)
+    const PROFILE_KEY = 'bb_ui_builder_profile';
+    function loadProfile() { try { state.profile = localStorage.getItem(PROFILE_KEY) || 'default'; } catch (e) { state.profile = 'default'; } }
+    function setProfile(p) {
+        state.profile = String(p || '').trim().replace(/[^A-Za-z0-9_.-]+/g, '') || 'default';
+        try { localStorage.setItem(PROFILE_KEY, state.profile); } catch (e) {}
+    }
+    // Folder containing config.json, walking up from `from`.
+    function findRegolithRoot(from) {
+        const fs = getFs();
+        let dir = String(from || '').replace(/\\/g, '/').replace(/\/+$/, '');
+        for (let i = 0; i < 12 && dir; i++) {
+            if (fs.existsSync(dir + '/config.json')) return dir;
+            const up = dir.replace(/\/[^/]*$/, '');
+            if (!up || up === dir) break;
+            dir = up;
+        }
+        return '';
+    }
+    function showOutput(title, ok, text) {
+        try { const old = Dialog.open; if (old && old.id === 'bb_ui_build_output') old.close(); } catch (e) {}
+        new Dialog({
+            id: 'bb_ui_build_output', title, width: 760,
+            lines: ['<div style="font-weight:bold;margin-bottom:6px;color:' + (ok ? '#00ce71' : '#fa565d') + '">' + (ok ? 'OK' : 'FALLO') + '</div>' +
+                '<pre style="max-height:420px;overflow:auto;white-space:pre-wrap;user-select:text;font-size:12px;background:var(--color-back);padding:8px;border-radius:4px">' + esc(text || '(sin salida)') + '</pre>'],
+            buttons: ['Cerrar'],
+        }).show();
+    }
+    // Resolves { ok, code, output, cwd, profile }. Never rejects (errors go in output).
+    function runRegolith(cwd, profile) {
+        return new Promise((resolve) => {
+            let cp = null;
+            try {
+                cp = typeof requireNativeModule === 'function' ? requireNativeModule('child_process', { message: 'BB UI Builder runs "regolith run" after exporting.' }) : require('child_process');
+            } catch (e) {}
+            if (!cp) return resolve({ ok: false, code: -1, output: 'No se pudo cargar child_process (se necesita Blockbench de escritorio).', cwd, profile });
+            let out = '', done = false, timer = null;
+            const finish = (r) => { if (done) return; done = true; clearTimeout(timer); resolve(Object.assign({ cwd, profile }, r, { output: out.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '') })); };
+            let child;
+            try { child = cp.spawn('regolith', ['run', profile], { cwd, shell: true, windowsHide: true }); }
+            catch (e) { out += String(e.message); return finish({ ok: false, code: -1 }); }
+            const add = (b) => { out += b.toString(); if (out.length > 200000) out = out.slice(-200000); };
+            child.stdout && child.stdout.on('data', add);
+            child.stderr && child.stderr.on('data', add);
+            child.on('error', (e) => { out += '\n' + e.message; finish({ ok: false, code: -1 }); });
+            child.on('close', (code) => finish({ ok: code === 0, code }));
+            timer = setTimeout(() => { out += '\n[timeout 10 min, proceso cancelado]'; try { child.kill(); } catch (e) {} finish({ ok: false, code: -2 }); }, 600000);
+        });
+    }
+    // Export, then `regolith run <profile>` in the Regolith project root. opts: { root, profile, silent }
+    async function exportAndBuild(opts) {
+        opts = opts || {};
+        if (state.building) throw new Error('Ya hay un build en curso.');
+        const root = opts.root || getExportRoot(false);
+        if (!root) throw new Error('No hay carpeta de exportacion.');
+        const r = exportTo(root, opts);
+        const proj = findRegolithRoot(r.dir);
+        if (!proj) {
+            const msg = 'Exportado a ' + r.dir + ', pero no se encontro config.json (raiz del proyecto Regolith) subiendo desde esa carpeta.';
+            if (!opts.silent) showOutput('Export & Build', false, msg);
+            return { ok: false, exported: r, output: msg };
+        }
+        const profile = opts.profile || state.profile || 'default';
+        state.building = true;
+        if (!opts.silent) Blockbench.showQuickMessage('regolith run ' + profile + '...', 3000);
+        let res;
+        try { res = await runRegolith(proj, profile); } finally { state.building = false; }
+        const head = '$ regolith run ' + profile + '   (en ' + proj + ')\nExportado: ' + r.dir + '\nCodigo de salida: ' + res.code + '\n\n';
+        if (!opts.silent) showOutput('Export & Build', res.ok, head + res.output);
+        return Object.assign(res, { exported: r, cwd: proj });
+    }
+    function exportAndBuildAction() {
+        exportAndBuild().catch((e) => {
+            if (e.validation) showValidation(e.validation, 'Export & Build: corrige esto primero');
+            else showOutput('Export & Build', false, e.message);
+        });
     }
 
     // ------------------------------------------------------------------ project persistence
@@ -503,6 +1041,7 @@
         script: [{ k: 'fn', t: 'text' }, { k: 'args', t: 'json' }],
         set: [{ k: 'key', t: 'text' }, { k: 'value', t: 'value' }],
         add: [{ k: 'key', t: 'text' }, { k: 'amount', t: 'number' }, { k: 'min', t: 'number', opt: true }, { k: 'max', t: 'number', opt: true }],
+        open_ui: [{ k: 'ui', t: 'text' }],
         sequence: [],
     };
 
@@ -522,6 +1061,7 @@
                 if (t === 'script') core.set(this.action, 'fn', '');
                 if (t === 'set') { core.set(this.action, 'key', ''); core.set(this.action, 'value', 0); }
                 if (t === 'add') { core.set(this.action, 'key', ''); core.set(this.action, 'amount', 1); }
+                if (t === 'open_ui') core.set(this.action, 'ui', '');
                 if (t === 'sequence') core.set(this.action, 'actions', []);
                 touch();
             },
@@ -628,13 +1168,19 @@
         '<div class="bbui-row" v-if="d.queries[k].source === \'script\'"><label>fn</label><input type="text" v-model="d.queries[k].fn" @change="touch()"></div>' +
         '<div class="bbui-row"><label>default</label><input type="number" :value="d.queries[k].default" @change="setDefault(k, $event.target.value)"></div></div>' +
         '<button @click="addQuery">+ Query</button></div>' +
-        '<div class="bbui-box"><button @click="doValidate">Validar</button> <button @click="doExport">Exportar al pack</button> <button @click="pickRoot">Carpeta...</button><div class="bbui-dim">{{root}}</div></div></div>';
+        '<div class="bbui-box"><b>Fonts</b>' +
+        '<div v-for="(f, k) in (d.fonts || {})" class="bbui-row"><span style="flex:1">{{k}} <span class="bbui-dim">{{Object.keys(f.glyphs).length}} glifos, glifo max {{f.size[0]}}x{{f.size[1]}} u</span></span><button class="bbui-x" @click="delFont(k)">x</button></div>' +
+        '<button @click="newFont">+ Fuente (cuadricula)</button> <button @click="newText">+ Texto</button></div>' +
+        '<div class="bbui-box"><label class="bbui-chk"><input type="checkbox" v-model="st.safe" @change="applySafe"> Guia de zona segura (16:9, solo editor)</label></div>' +
+        '<div class="bbui-box"><button @click="doValidate">Validar</button> <button @click="doExport">Exportar al pack</button> <button @click="pickRoot">Carpeta...</button><div class="bbui-dim">{{root}}</div>' +
+        '<div class="bbui-row"><label>perfil</label><input type="text" :value="st.profile" @change="setProf($event.target.value)"></div>' +
+        '<button :disabled="st.building" @click="doBuild">{{st.building ? \'Construyendo...\' : \'Export & Build\'}}</button></div></div>';
 
     // ------------------------------------------------------------------ panels
     function getRootLabel() { try { return localStorage.getItem(STORE_KEY) || '(sin carpeta de exportacion)'; } catch (e) { return ''; } }
 
     function makePanels() {
-        const cond = { formats: [FORMAT_ID], modes: ['edit'] };
+        const cond = { formats: [FORMAT_ID], modes: [MODE_ID] };
         const pos = { slot: 'right_bar', float_position: [0, 0], float_size: [320, 420], height: 300, folded: false };
 
         panels.push(new Panel('bb_ui_screens', {
@@ -681,7 +1227,7 @@
                     mv(d) { previewMove(d); },
                     ok() { previewAccept(); },
                 },
-                template: TPL_SCREENS,
+                template: '<div class="bbui-root">' + TPL_SCREENS + '</div>', // fixed root: Blockbench 5 panels need an element even with no data
             },
         }));
 
@@ -705,13 +1251,13 @@
                     setRole(r) {
                         const screenId = this.info ? this.info.screen.id : this.st.activeScreen;
                         core.assignBone(this.st.data, screenId, this.st.sel, r, this.queryNames);
-                        touch();
+                        touch(); applyRoleColors();
                     },
                     moveTo(id) {
                         const role = this.role, old = this.el ? clone(this.el) : null;
                         core.assignBone(this.st.data, id, this.st.sel, role, this.queryNames);
                         if (old) { const ne = core.findBone(this.st.data, this.st.sel).element; for (const k of Object.keys(old)) core.set(ne, k, old[k]); }
-                        touch();
+                        touch(); applyRoleColors();
                     },
                     hasNav(d) { return !!(this.el.nav && Object.prototype.hasOwnProperty.call(this.el.nav, d)); },
                     setNav(d, v) {
@@ -719,14 +1265,14 @@
                         else { if (!this.el.nav) core.set(this.el, 'nav', {}); core.set(this.el.nav, d, v === '__none' ? null : v); }
                         touch();
                     },
-                    setHl(v) { if (v) core.set(this.el, 'highlight', v); else core.del(this.el, 'highlight'); touch(); },
+                    setHl(v) { if (v) core.set(this.el, 'highlight', v); else core.del(this.el, 'highlight'); touch(); applyRoleColors(); },
                     toggleVis(on) {
                         if (on) core.set(this.el, 'visible_if', { query: this.queryNames[0] || '', op: '>=', value: 1 });
                         else core.del(this.el, 'visible_if');
                         touch();
                     },
                 },
-                template: TPL_ELEMENT,
+                template: '<div class="bbui-root">' + TPL_ELEMENT + '</div>', // fixed root: Blockbench 5 panels need an element even with no data
             },
         }));
 
@@ -779,11 +1325,17 @@
                         touch();
                     },
                     setDefault(k, v) { if (v === '') core.del(this.d.queries[k], 'default'); else core.set(this.d.queries[k], 'default', Number(v) || 0); touch(); },
+                    delFont(k) { removeFont(k); },
+                    newFont() { try { fontDialog(); } catch (e) { Blockbench.showQuickMessage(e.message, 2500); } },
+                    newText() { try { textDialog(); } catch (e) { Blockbench.showQuickMessage(e.message, 2500); } },
+                    applySafe() { setSafe(this.st.safe); },
+                    setProf(v) { setProfile(v); },
+                    doBuild() { exportAndBuildAction(); },
                     doValidate() { showValidation(validate()); },
                     doExport() { exportAction(); this.root = getRootLabel(); },
                     pickRoot() { getExportRoot(true); this.root = getRootLabel(); },
                 },
-                template: TPL_SETTINGS,
+                template: '<div class="bbui-root">' + TPL_SETTINGS + '</div>', // fixed root: Blockbench 5 panels need an element even with no data
             },
         }));
     }
@@ -793,7 +1345,7 @@
         '.bbui-screen{display:flex;align-items:center;gap:4px;padding:2px 4px;border-radius:3px}.bbui-screen.active{background:var(--color-selected)}.bbui-name{flex:1;cursor:pointer}' +
         '.bbui-tag{font-size:10px;opacity:.7}.bbui-dim{opacity:.6}.bbui-chk{display:inline-flex;gap:4px;align-items:center}.bbui-x{padding:0 6px}' +
         '.bbui-seq{margin-left:10px}.bbui-seqitem{display:flex;gap:4px;align-items:flex-start;border-left:2px solid var(--color-border);padding-left:4px;margin:3px 0}' +
-        '.bbui-pad{margin-top:6px;text-align:center}.bbui-pad button{min-width:34px;margin:1px}';
+        '.bbui-pkwrap{max-height:400px;overflow:auto;border:1px solid var(--color-border);margin:4px 0}.bbui-pkwrap canvas{display:block;image-rendering:pixelated;cursor:crosshair}.bbui-pad{margin-top:6px;text-align:center}.bbui-pad button{min-width:34px;margin:1px}';
 
     // ------------------------------------------------------------------ actions
     function makeActions() {
@@ -807,12 +1359,19 @@
         };
         const list = [
             mk('add_button', 'UI: Add Button', 'smart_button', () => addElement('button')),
-            mk('add_image', 'UI: Add Image', 'image', () => addElement('image')),
+            mk('add_image', 'UI: Add Image', 'image', imageDialog),
+            mk('add_text', 'UI: Add Text', 'text_fields', textDialog),
+            mk('add_font', 'UI: Create Font', 'font_download', fontDialog),
+            mk('add_plain_image', 'UI: Add Plain Image Slot', 'crop_original', () => addElement('image')),
             mk('add_number', 'UI: Add Number', 'pin', () => addElement('number')),
             mk('add_model', 'UI: Add Model Slot', 'view_in_ar', () => addElement('model')),
             mk('preview', 'UI: Preview navigation', 'gamepad', () => { syncState(); if (state.preview.on) previewStop(); else previewStart(); }),
             mk('validate', 'UI: Validate', 'rule', () => showValidation(validate())),
             mk('export', 'UI: Export to pack', 'upload', exportAction),
+            mk('export_build', 'UI: Export & Build', 'build', exportAndBuildAction),
+            mk('build_profile', 'UI: Set build profile', 'tune', () => Blockbench.textPrompt('Perfil de regolith (regolith run <perfil>)', state.profile, (v) => setProfile(v))),
+            mk('safe_zone', 'UI: Toggle safe-zone guide', 'crop_free', () => setSafe(!state.safe)),
+            mk('role_colors', 'UI: Refresh role colours', 'palette', applyRoleColors),
             mk('export_root', 'UI: Set export folder', 'folder_open', () => getExportRoot(true)),
         ];
         try {
@@ -823,6 +1382,35 @@
             for (const a of list) { try { MenuBar.addAction(a, 'tools'); } catch (e2) {} }
         }
         try { const tb = Toolbars.outliner; if (tb) { for (const a of list.slice(0, 4)) tb.add(a); tb.update(); } } catch (e) {}
+    }
+
+    // ------------------------------------------------------------------ mode
+    // Fourth editor tab ("UI"), next to Edit / Paint / Animate: the UI panels live here, with the outliner and textures.
+    function registerMode() {
+        if (typeof Mode === 'undefined') return;
+        modeObj = new Mode(MODE_ID, {
+            name: 'UI',
+            icon: 'dashboard_customize',
+            default_tool: 'move_tool',
+            category: 'navigate',
+            condition: () => isUi(),
+            onSelect() { try { syncState(); applyVisibility(); } catch (e) {} },
+            onUnselect() { try { if (state.preview.on) previewStop(); } catch (e) {} },
+        });
+        for (const id of SHARED_PANELS) {
+            const p = typeof Panels !== 'undefined' && Panels[id];
+            const c = p && p.condition;
+            if (c && Array.isArray(c.modes) && !c.modes.includes(MODE_ID)) { c.modes.push(MODE_ID); patchedPanels.push(c); }
+        }
+        try { if (Modes.vue) Modes.vue.$forceUpdate(); } catch (e) {}
+    }
+
+    function unregisterMode() {
+        for (const c of patchedPanels) { const i = c.modes.indexOf(MODE_ID); if (i >= 0) c.modes.splice(i, 1); }
+        patchedPanels.length = 0;
+        if (modeObj) modeObj.delete();
+        modeObj = null;
+        try { if (Modes.vue) Modes.vue.$forceUpdate(); } catch (e) {}
     }
 
     // ------------------------------------------------------------------ format
@@ -848,7 +1436,16 @@
         formatObj = new ModelFormat(FORMAT_ID, opts);
     }
 
-    function poll() { try { syncState(); } catch (e) {} }
+    function poll() {
+        try { trackRenames(); } catch (e) { console.warn('BB UI Builder: rename tracking', e); }
+        try { syncState(); } catch (e) {}
+        try { processTextures(); } catch (e) {}
+        try {
+            const sig = state.rev + '|' + state.groups.join('|');
+            if (isUi() && sig !== colorSig) { colorSig = sig; applyRoleColors(); }
+        } catch (e) {}
+        try { if (isUi() || safeObj) safeZone(); } catch (e) {}
+    }
 
     BBPlugin.register(PLUGIN_ID, {
         title: 'BB UI Builder',
@@ -862,10 +1459,13 @@
         onload() {
             styleEl = Blockbench.addCSS(CSS);
             registerFormat();
+            registerMode();
             makePanels();
             makeActions();
             if (Codecs.project && Codecs.project.on) { Codecs.project.on('compile', onCompile); Codecs.project.on('parse', onParse); }
-            for (const ev of ['update_selection', 'select_project', 'new_project', 'load_project']) {
+            loadProfile();
+            Blockbench.on('add_texture', onAddTexture);
+            for (const ev of ['update_selection', 'select_project', 'new_project', 'load_project', 'finished_edit']) {
                 Blockbench.on(ev, poll);
                 listeners.push(ev);
             }
@@ -884,6 +1484,10 @@
                 getData: () => { const d = getData(); return d ? clone(d) : null; },
                 setData: (obj) => { if (!isUi()) throw new Error('No hay proyecto Minecraft UI.'); Project.bbui = clone(obj); state.data = null; syncState(); touch(); },
                 exportTo: (path, opts) => exportTo(path, opts),
+                exportAndBuild: (opts) => exportAndBuild(opts),
+                addImage, addText, addFont, removeFont, setSafe, applyRoleColors, setProfile,
+                imageDialog, textDialog, fontDialog,
+                safeZoneInfo: () => (safeObj ? clone(safeObj.bbui_info) : null),
                 validate,
                 core,
             };
@@ -891,7 +1495,9 @@
         },
         onunload() {
             const step = (f) => { try { f(); } catch (e) { console.warn('BB UI Builder unload:', e); } };
+            step(() => Blockbench.removeListener('add_texture', onAddTexture));
             step(() => clearInterval(pollTimer));
+            step(() => { state.safe = false; removeSafe(); });
             step(() => document.removeEventListener('keydown', keyHandler, true));
             step(() => listeners.forEach((ev) => Blockbench.removeListener(ev, poll)));
             step(() => {
@@ -905,6 +1511,7 @@
             step(() => actions.forEach((a) => a.delete()));
             step(() => panels.forEach((p) => p.delete()));
             step(() => styleEl && styleEl.delete());
+            step(unregisterMode);
             step(() => { if (formatObj) formatObj.delete(); });
             actions = []; panels = []; listeners = []; formatObj = null; menus.length = 0;
             delete window.BBUIBuilder;
