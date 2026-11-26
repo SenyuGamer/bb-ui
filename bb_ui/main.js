@@ -529,6 +529,8 @@ const round = (v) => Math.round(v * 1000) / 1000;
 
 // Root bone of every geometry of the entity: the RP rotates it with NS:yaw (the entity body itself never turns).
 const YAW_BONE = '__bbui_yaw';
+// Bedrock draws only the first 127 bones of a geometry (seen in game: bone #127 and later stay invisible).
+const MAX_DRAWN_BONES = 127;
 // Puts YAW_BONE first and parents every former root bone to it (list order, so draw order, unchanged).
 function wrapYaw(bones) {
   return [{ name: YAW_BONE, pivot: [0, 0, 0] }, ...bones.map((b) => (b.parent == null ? { ...b, parent: YAW_BONE } : b))];
@@ -810,7 +812,7 @@ function mInvRigid(m) {
 //    without parent/pivot/rotation.
 // Cube pivot default: absent pivot = [0,0,0] of geo space (Bedrock; same as geoWorld), not the cube center.
 // Returns { bones, mergedVis: Map(mergedBoneName -> expression) } ordered back to front (larger z first).
-function flattenForXray(srcBones, gw, refBones, visOf, warn) {
+function flattenForXray(srcBones, gw, refBones, visOf, warn, mergedPrefix = '__bbui_g') {
   const byName = new Map(srcBones.map((b) => [b.name, b]));
   const kids = new Map();
   for (const b of srcBones) {
@@ -844,7 +846,7 @@ function flattenForXray(srcBones, gw, refBones, visOf, warn) {
   }
   let gi = 0;
   const used = new Set(byName.keys());
-  const newName = () => { let n; do { n = `__bbui_g${gi++}`; } while (used.has(n)); used.add(n); return n; };
+  const newName = () => { let n; do { n = `${mergedPrefix}${gi++}`; } while (used.has(n)); used.add(n); return n; };
 
   // bake cube c of bone b with matrix M (cube-bone frame -> target frame); returns { cube, } in the target frame
   const bake = (b, c, M, rootBone) => {
@@ -1170,43 +1172,77 @@ async function generateUi(uiId, ui, geo, ctx) {
     ownExpr.set(bone, uniq.length === 1 ? uniq[0] : uniq.map((c) => `(${c})`).join(' || '));
   }
   const parentOf = new Map(geoDesc.bones.map((b) => [b.name, b.parent]));
-  // language conditions are ANDed (never OR-joined like screen conditions): bone -> expression
-  const langExpr = new Map();
-  if (langActive(ui) && isObj(ui.translations)) {
-    for (const [bone, code] of Object.entries(ui.translations)) langExpr.set(bone, `${P('lang')} == ${ui.languages.indexOf(code)}`);
-  }
   // effective condition of a bone ('' = none): its own ANDed with all ancestors'
   const visOf = (name) => {
     const chain = [];
     for (let n = name, guard = 0; n && guard < 64; n = parentOf.get(n), guard++) {
       if (ownExpr.has(n)) chain.push(ownExpr.get(n));
-      if (langExpr.has(n)) chain.push(langExpr.get(n));
     }
     return chain.map((c) => `(${c})`).join(' && ');
   };
-  let outBones = geoDesc.bones;
-  let mergedVis = new Map();
+  // languages: one geometry per language (the render controller picks it with NS:lang). A bone translated to
+  // another language is left out with its whole subtree, so no geometry carries the other languages' bones
+  // (Bedrock draws only the first ~127 bones of a geometry: one geometry with every language went blank).
+  const langs = langActive(ui) ? ui.languages : [null];
+  const transl = langActive(ui) && isObj(ui.translations) ? ui.translations : {};
+  const bonesFor = (code) => {
+    if (code == null) return geoDesc.bones;
+    const otherLang = (name) => {
+      for (let n = name, guard = 0; n && guard < 64; n = parentOf.get(n), guard++) {
+        if (transl[n] !== undefined && transl[n] !== code) return true;
+      }
+      return false;
+    };
+    return geoDesc.bones.filter((b) => !otherLang(b.name));
+  };
 
   // ---- RP geometry / textures
-  const geoOut = JSON.parse(JSON.stringify(geo));
-  geoOut['minecraft:geometry'][0].description.identifier = `geometry.bb_ui.${ID}`;
   const xray = ui.display?.xray !== false;
+  const refs = [];
   if (xray) {
-    // Without depth test the draw order decides what is on top: draw back to front, cube by cube.
-    // The UI faces -Z toward the viewer, so a larger z is further back. bonePos/centerY above were
-    // computed from the original geometry. Bones used by elements/highlights keep their structure.
-    const refs = [];
     for (const sc of ui.screens) for (const e of sc.elements || []) { refs.push(e.bone); if (e.highlight) refs.push(e.highlight); }
     if (plan) refs.push(...plan.animatedBones); // animated bones keep their name/pivot (preserved roots)
-    const flat = flattenForXray(geoDesc.bones, gw, refs.filter(Boolean), visOf, (m) => console.warn(`[bb_ui] aviso: ${m}`));
-    geoOut['minecraft:geometry'][0].bones = flat.bones;
-    outBones = flat.bones;
-    mergedVis = flat.mergedVis;
   }
-  if (outBones.some((b) => b.name === YAW_BONE)) err(uiId, `el nombre de hueso "${YAW_BONE}" esta reservado`);
-  geoOut['minecraft:geometry'][0].bones = wrapYaw(geoOut['minecraft:geometry'][0].bones);
+  const warned = new Set();
+  const warnOnce = (m) => { if (!warned.has(m)) { warned.add(m); console.warn(`[bb_ui] aviso: ${m}`); } };
+  const partVis = [{ '*': viewer }];
+  const partSeen = new Set();
+  const langGeos = []; // [geometry key in the client entity, identifier]
   writeEntityMaterials();
-  writeJson(path.join(T_RP, `models/entity/bb_ui/${ID}.geo.json`), geoOut);
+  for (let li = 0; li < langs.length; li++) {
+    const srcBones = bonesFor(langs[li]);
+    let outBones = srcBones;
+    let mergedVis = new Map();
+    const geoOut = JSON.parse(JSON.stringify(geo));
+    const ident = li ? `geometry.bb_ui.${ID}.lang${li}` : `geometry.bb_ui.${ID}`;
+    geoOut['minecraft:geometry'][0].description.identifier = ident;
+    if (xray) {
+      // Without depth test the draw order decides what is on top: draw back to front, cube by cube.
+      // The UI faces -Z toward the viewer, so a larger z is further back. bonePos/centerY above were
+      // computed from the original geometry. Bones used by elements/highlights keep their structure.
+      // Merged bones get a per-language prefix: they share one render controller.
+      const flat = flattenForXray(srcBones, gw, refs.filter(Boolean), visOf, warnOnce, li ? `__bbui_l${li}_g` : '__bbui_g');
+      outBones = flat.bones;
+      mergedVis = flat.mergedVis;
+    } else {
+      outBones = JSON.parse(JSON.stringify(srcBones));
+    }
+    if (outBones.some((b) => b.name === YAW_BONE)) err(uiId, `el nombre de hueso "${YAW_BONE}" esta reservado`);
+    geoOut['minecraft:geometry'][0].bones = wrapYaw(outBones);
+    const nBones = outBones.length + 1;
+    if (nBones > MAX_DRAWN_BONES) {
+      warnOnce(`${uiId}${langs[li] ? ` (${langs[li]})` : ''}: la geometria tiene ${nBones} huesos y Bedrock solo dibuja los primeros ${MAX_DRAWN_BONES}; ` +
+        'el resto sale invisible. Junta huesos (mismas condiciones de visibilidad) o reparte piezas entre ventanas.');
+    }
+    writeJson(path.join(T_RP, `models/entity/bb_ui/${ID}${li ? `_lang${li}` : ''}.geo.json`), geoOut);
+    langGeos.push([li ? `lang${li}` : 'default', ident]);
+    for (const b of outBones) {
+      if (partSeen.has(b.name)) continue;
+      partSeen.add(b.name);
+      const e = mergedVis.has(b.name) ? mergedVis.get(b.name) : visOf(b.name);
+      if (e) partVis.push({ [b.name]: `${viewer} && ${e}` });
+    }
+  }
   mkdirp(path.join(T_RP, 'textures/bb_ui'));
   fs.copyFileSync(path.join(DATA_DIR, ID, 'texture.png'), path.join(T_RP, `textures/bb_ui/${ID}.png`));
   const hasDigits = numberList.length > 0;
@@ -1229,11 +1265,6 @@ async function generateUi(uiId, ui, geo, ctx) {
   }
 
   // ---- render controllers
-  const partVis = [{ '*': viewer }];
-  for (const b of outBones) {
-    const e = mergedVis.has(b.name) ? mergedVis.get(b.name) : visOf(b.name);
-    if (e) partVis.push({ [b.name]: `${viewer} && ${e}` });
-  }
   const NO_TINT = { r: '0.0', g: '0.0', b: '0.0', a: '0.0' };
   const rcMain = {
     geometry: 'Geometry.default',
@@ -1245,6 +1276,10 @@ async function generateUi(uiId, ui, geo, ctx) {
     on_fire_color: NO_TINT,
     part_visibility: partVis,
   };
+  if (langGeos.length > 1) {
+    rcMain.arrays = { geometries: { 'Array.lang': langGeos.map(([k]) => `Geometry.${k}`) } };
+    rcMain.geometry = `Array.lang[${P('lang')}]`;
+  }
   const rcs = { [`controller.render.bb_ui.${ID}`]: rcMain };
   if (hasDigits) {
     const dv = [{ '*': 'false' }];
@@ -1396,6 +1431,7 @@ async function generateUi(uiId, ui, geo, ctx) {
     geometry: { default: `geometry.bb_ui.${ID}` },
     render_controllers: [`controller.render.bb_ui.${ID}`],
   };
+  for (const [k, ident] of langGeos.slice(1)) desc.geometry[k] = ident;
   if (hasBackdropGeo) {
     // first in the list: drawn before the UI
     desc.materials.backdrop = 'bb_ui.backdrop';

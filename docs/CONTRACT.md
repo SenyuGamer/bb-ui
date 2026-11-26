@@ -81,7 +81,7 @@ su pantalla.
 ```
 - Validación: `languages` = códigos únicos (`es`, `pt_br`...); cada valor de `translations` debe estar en `languages` y cada clave debe ser un hueso de la geometría. Sin `languages` (o con un solo idioma) `translations` se ignora (con aviso) y la salida es idéntica a la de una UI sin idiomas.
 - Propiedad de entidad `<ns>:lang` (int, rango `0..max(n-1,1)`, def. 0, `client_sync`; cuenta en el límite de 32). El runtime la pone al abrir la UI y al guardar los ajustes: índice del idioma del jugador en `languages`.
-- Visibilidad: la condición de idioma (`q.property('<ns>:lang') == i`) se une con `&&` a la de pantalla/elemento de ese hueso y de sus ancestros (nunca con `||`).
+- Geometría: una por idioma (`geometry.bb_ui.<id>` para el primero, `geometry.bb_ui.<id>.lang<i>` para los demás). Cada una deja fuera los huesos traducidos a otro idioma (con su subárbol), y el render controller elige la del jugador con `Array.lang[q.property('<ns>:lang')]`. Así ninguna geometría lleva los huesos de todos los idiomas: Bedrock solo dibuja los primeros 127 huesos de una geometría, y el filtro avisa si una pasa de ahí.
 - Idioma del jugador: dynamic property `bb_ui:lang` (código, compartida por todas las UIs); si falta o no está en `languages`, se usa el primero. El registro generado incluye `languages` y `translations`.
 - La acción `settings` añade (si la UI tiene 2+ idiomas) un desplegable "Idioma / Language" con los nombres (es Español, en English, pt Português, fr, de, it, ja, ko, zh, ru; si no, el código) y lo aplica al momento. Los textos del formulario salen en es/en/pt según el idioma actual (por defecto español).
 
